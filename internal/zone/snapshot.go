@@ -15,7 +15,8 @@ import (
 	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
-// maxCNAMEChain bounds in-zone CNAME chasing (loops are possible: a -> b -> a).
+// maxCNAMEChain bounds the number of CNAMEs followed inside our zones.
+// Loops (a -> b -> a) are detected separately and stop earlier.
 const maxCNAMEChain = 8
 
 // Rcode is the subset of DNS response codes the snapshot can decide on its own.
@@ -32,7 +33,8 @@ type Result struct {
 	// the caller should forward the query upstream.
 	Authoritative bool
 	Rcode         Rcode
-	// Zone is the zone that answered (for building the SOA). Set when Authoritative.
+	// Zone is the zone of the last in-zone name in the chain (for building the
+	// SOA of a negative answer). Set when Authoritative.
 	Zone *api.Zone
 	// Answer holds the records to return, in order (CNAME chain first).
 	// TTLs are already resolved (record TTL or zone default).
@@ -42,6 +44,10 @@ type Result struct {
 	ChaseTarget string
 	// SOA is true when the answer for qtype SOA at the apex should be synthesized.
 	SOA bool
+	// NoData is true when the last name in the chain exists (or is an empty
+	// non-terminal) but has no data of qtype. With NXDomain it marks the
+	// negative answers that carry the SOA of Zone in the authority section.
+	NoData bool
 }
 
 type node struct {
@@ -119,13 +125,17 @@ func (s *Snapshot) Lookup(qname string, qtype uint16) Result {
 	}
 	res := Result{Authoritative: true, Zone: z}
 	name := qname
-	for i := 0; i <= maxCNAMEChain; i++ {
+	visited := map[string]bool{}
+	for {
+		visited[name] = true
 		n := s.names[name]
 		if n == nil {
 			if name == z.Name || s.ents[name] {
 				// Apex with no records, or an empty non-terminal.
 				if name == qname && qtype == api.QTypeSOA && name == z.Name {
 					res.SOA = true
+				} else {
+					res.NoData = true
 				}
 				return res
 			}
@@ -149,8 +159,12 @@ func (s *Snapshot) Lookup(qname string, qtype uint16) Result {
 			}
 		}
 		if matched || cname == nil || qtype == api.QTypeCNAME {
-			if !matched && name == qname && qtype == api.QTypeSOA && name == z.Name {
-				res.SOA = true
+			if !matched {
+				if name == qname && qtype == api.QTypeSOA && name == z.Name {
+					res.SOA = true
+				} else {
+					res.NoData = true
+				}
 			}
 			return res
 		}
@@ -163,11 +177,15 @@ func (s *Snapshot) Lookup(qname string, qtype uint16) Result {
 			res.ChaseTarget = target
 			return res
 		}
+		if visited[target] || len(visited) >= maxCNAMEChain {
+			// A loop or an overlong chain: return each CNAME once and let
+			// the client's resolver give up on it.
+			return res
+		}
 		name = target
 		z = tz
+		res.Zone = tz
 	}
-	// Chain too long or a loop: return what we collected.
-	return res
 }
 
 func parent(name string) string {

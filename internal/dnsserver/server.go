@@ -121,17 +121,20 @@ func (h *Handler) answer(r *dns.Msg) (*dns.Msg, string) {
 			if up.Rcode == dns.RcodeNameError {
 				m.Rcode = dns.RcodeNameError
 			}
+			if up.Rcode == dns.RcodeNameError || len(up.Answer) == 0 {
+				// Negative upstream answer: pass its SOA on for negative caching.
+				m.Ns = append(m.Ns, up.Ns...)
+			}
 		}
 		return m, "authoritative"
 	}
-	if res.Rcode == zone.NXDomain {
+	switch {
+	case res.Rcode == zone.NXDomain:
 		m.Rcode = dns.RcodeNameError
-	}
-	if m.Rcode == dns.RcodeNameError || (len(res.Answer) == 0 && !res.SOA) {
 		m.Ns = append(m.Ns, h.soa(res.Zone))
-		if m.Rcode == dns.RcodeNameError {
-			return m, "nxdomain"
-		}
+		return m, "nxdomain"
+	case res.NoData:
+		m.Ns = append(m.Ns, h.soa(res.Zone))
 		return m, "nodata"
 	}
 	return m, "authoritative"

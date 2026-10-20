@@ -53,6 +53,8 @@ func startHorus(t *testing.T, upstream string) string {
 		[]api.Record{
 			{Zone: "prod.internal.example.", Name: "app.prod.internal.example.", Type: api.TypeA, Data: "10.0.0.1"},
 			{Zone: "prod.internal.example.", Name: "ext.prod.internal.example.", Type: api.TypeCNAME, Data: "lb.cloud.example.com."},
+			{Zone: "prod.internal.example.", Name: "www.prod.internal.example.", Type: api.TypeCNAME, Data: "app.prod.internal.example."},
+			{Zone: "prod.internal.example.", Name: "gone.prod.internal.example.", Type: api.TypeCNAME, Data: "nope.example.com."},
 		},
 	))
 	fwd := NewForwarder(ForwarderOptions{
@@ -105,6 +107,15 @@ func TestAuthoritative(t *testing.T) {
 	if r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0 || len(r.Ns) != 1 {
 		t.Fatalf("nodata: %v", r)
 	}
+
+	// NODATA at the end of an in-zone CNAME chain still carries the SOA.
+	r = query(t, addr, "www.prod.internal.example.", dns.TypeAAAA)
+	if r.Rcode != dns.RcodeSuccess || len(r.Answer) != 1 || len(r.Ns) != 1 {
+		t.Fatalf("cname nodata: %v", r)
+	}
+	if _, ok := r.Ns[0].(*dns.SOA); !ok {
+		t.Fatalf("cname nodata authority: %v", r.Ns)
+	}
 }
 
 func TestCNAMEChaseUpstream(t *testing.T) {
@@ -116,6 +127,12 @@ func TestCNAMEChaseUpstream(t *testing.T) {
 	}
 	if _, ok := r.Answer[0].(*dns.CNAME); !ok {
 		t.Fatalf("first answer must be the CNAME: %v", r.Answer)
+	}
+
+	// The upstream target does not exist: NXDOMAIN with the upstream SOA.
+	r = query(t, addr, "gone.prod.internal.example.", dns.TypeA)
+	if r.Rcode != dns.RcodeNameError || len(r.Answer) != 1 || len(r.Ns) != 1 {
+		t.Fatalf("expected CNAME + NXDOMAIN with SOA, got %v", r)
 	}
 }
 

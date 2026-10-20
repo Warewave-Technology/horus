@@ -1,6 +1,7 @@
 package zone
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/Warewave-Technology/horus/pkg/api"
@@ -22,6 +23,7 @@ func testSnapshot() *Snapshot {
 		{Zone: "prod.internal.example.", Name: "loop1.prod.internal.example.", Type: api.TypeCNAME, Data: "loop2.prod.internal.example."},
 		{Zone: "prod.internal.example.", Name: "loop2.prod.internal.example.", Type: api.TypeCNAME, Data: "loop1.prod.internal.example."},
 		{Zone: "prod.internal.example.", Name: "x.deep.prod.internal.example.", Type: api.TypeA, Data: "10.0.0.9"},
+		{Zone: "prod.internal.example.", Name: "crossmiss.prod.internal.example.", Type: api.TypeCNAME, Data: "nope.staging.internal.example."},
 		{Zone: "staging.internal.example.", Name: "api.staging.internal.example.", Type: api.TypeA, Data: "10.1.0.1"},
 		{Zone: "unknown.example.", Name: "orphan.unknown.example.", Type: api.TypeA, Data: "10.9.9.9"},
 	}
@@ -64,7 +66,24 @@ func TestLookup(t *testing.T) {
 
 	t.Run("NODATA", func(t *testing.T) {
 		r := s.Lookup("app.prod.internal.example.", 16) // TXT
-		if !r.Authoritative || r.Rcode != NoError || len(r.Answer) != 0 {
+		if !r.Authoritative || r.Rcode != NoError || len(r.Answer) != 0 || !r.NoData {
+			t.Fatalf("got %+v", r)
+		}
+		if s.Lookup("app.prod.internal.example.", api.QTypeA).NoData {
+			t.Fatal("positive answer flagged NoData")
+		}
+	})
+
+	t.Run("NODATA at the end of a CNAME chain", func(t *testing.T) {
+		r := s.Lookup("www.prod.internal.example.", 16) // TXT
+		if r.Rcode != NoError || !r.NoData || len(r.Answer) != 1 || r.Answer[0].Type != api.TypeCNAME {
+			t.Fatalf("got %+v", r)
+		}
+	})
+
+	t.Run("negative answer uses the zone of the last name", func(t *testing.T) {
+		r := s.Lookup("crossmiss.prod.internal.example.", api.QTypeA)
+		if r.Rcode != NXDomain || len(r.Answer) != 1 || r.Zone.Name != "staging.internal.example." {
 			t.Fatalf("got %+v", r)
 		}
 	})
@@ -78,14 +97,14 @@ func TestLookup(t *testing.T) {
 
 	t.Run("empty non-terminal is NODATA", func(t *testing.T) {
 		r := s.Lookup("deep.prod.internal.example.", api.QTypeA)
-		if r.Rcode != NoError || len(r.Answer) != 0 {
+		if r.Rcode != NoError || len(r.Answer) != 0 || !r.NoData {
 			t.Fatalf("got %+v", r)
 		}
 	})
 
 	t.Run("apex SOA", func(t *testing.T) {
 		r := s.Lookup("prod.internal.example.", api.QTypeSOA)
-		if !r.SOA || r.Rcode != NoError {
+		if !r.SOA || r.NoData || r.Rcode != NoError {
 			t.Fatalf("got %+v", r)
 		}
 		if s.Lookup("app.prod.internal.example.", api.QTypeSOA).SOA {
@@ -131,10 +150,24 @@ func TestLookup(t *testing.T) {
 		}
 	})
 
-	t.Run("CNAME loop terminates", func(t *testing.T) {
+	t.Run("CNAME loop terminates without repeating records", func(t *testing.T) {
 		r := s.Lookup("loop1.prod.internal.example.", api.QTypeA)
-		if len(r.Answer) == 0 || len(r.Answer) > maxCNAMEChain+1 {
-			t.Fatalf("got %d answers", len(r.Answer))
+		if len(r.Answer) != 2 || r.Answer[0].Name != "loop1.prod.internal.example." ||
+			r.Answer[1].Name != "loop2.prod.internal.example." || r.Rcode != NoError {
+			t.Fatalf("got %+v", r)
+		}
+	})
+
+	t.Run("long CNAME chain is cut at maxCNAMEChain", func(t *testing.T) {
+		z := api.Zone{Name: "c.example.", DefaultTTL: 60}
+		var recs []api.Record
+		for i := 0; i < 20; i++ {
+			recs = append(recs, api.Record{Zone: z.Name, Name: fmt.Sprintf("n%d.c.example.", i),
+				Type: api.TypeCNAME, Data: fmt.Sprintf("n%d.c.example.", i+1)})
+		}
+		r := Build([]api.Zone{z}, recs).Lookup("n0.c.example.", api.QTypeA)
+		if len(r.Answer) != maxCNAMEChain || r.NoData || r.Rcode != NoError {
+			t.Fatalf("got %d answers: %+v", len(r.Answer), r)
 		}
 	})
 }
@@ -145,7 +178,7 @@ func TestHolder(t *testing.T) {
 		t.Fatal("empty holder must have an empty snapshot")
 	}
 	h.Store(testSnapshot())
-	if h.Load().Len() != 11 || h.Load().Zones() != 2 {
+	if h.Load().Len() != 12 || h.Load().Zones() != 2 {
 		t.Fatalf("len=%d zones=%d", h.Load().Len(), h.Load().Zones())
 	}
 }
