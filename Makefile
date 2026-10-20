@@ -39,6 +39,8 @@ install: build
 	install -m 0644 deploy/systemd/horus.service /etc/systemd/system/horus.service
 	install -m 0644 deploy/systemd/horus-backup.service /etc/systemd/system/horus-backup.service
 	install -m 0644 deploy/systemd/horus-backup.timer /etc/systemd/system/horus-backup.timer
+	test ! -f /etc/horus/tls/tls.crt || (install -d -m 0755 /etc/systemd/system/horus.service.d && \
+		install -m 0644 deploy/systemd/horus-tls.conf /etc/systemd/system/horus.service.d/tls.conf)
 	systemctl daemon-reload
 	@echo "Now: systemctl enable --now horus horus-backup.timer && horus zone ls"
 

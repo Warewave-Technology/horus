@@ -171,6 +171,15 @@ client-go. Shares `pkg/api`, `pkg/client`, `pkg/ingressdns`.
   If systemd-resolved's stub listener holds `127.0.0.53:53`, either bind
   horus to a specific address (`HORUS_DNS_LISTEN=10.0.0.53:53`) or set
   `DNSStubListener=no`.
+- API TLS: operators reach the API over `HORUS_API_LISTEN` (e.g. `:8053`);
+  use TLS there. The service runs with `DynamicUser=yes`, so the cert and key
+  are passed as systemd credentials: put them at `/etc/horus/tls/tls.{crt,key}`
+  (key `0600 root`) and install `deploy/systemd/horus-tls.conf` as a drop-in
+  (`make install` does this when the cert exists). horus uses
+  `$CREDENTIALS_DIRECTORY/api-tls-{cert,key}` unless `HORUS_API_TLS_CERT/KEY`
+  are set. The key pair is loaded before `READY=1`, so a bad cert fails the
+  start. Credentials are copied at start: restart (not reload) after renewal.
+  Operators that do not trust the issuing CA get it via `--ca-file`.
 - Readiness: `READY=1` is sent only after both DNS sockets and the API are
   bound. Watchdog: 30s.
 - Backups: `horus backup` → `VACUUM INTO` a timestamped file under

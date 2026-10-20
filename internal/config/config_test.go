@@ -70,3 +70,38 @@ func TestFromEnvErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestTLSFromCredentials(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"admin-token", "api-tls-cert", "api-tls-key"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(strings.Repeat("c", 40)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := FromEnv(env(map[string]string{"CREDENTIALS_DIRECTORY": dir, "HORUS_API_LISTEN": ":8053"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TLSCert != filepath.Join(dir, "api-tls-cert") || c.TLSKey != filepath.Join(dir, "api-tls-key") {
+		t.Fatalf("tls from credentials: %q %q", c.TLSCert, c.TLSKey)
+	}
+
+	// Explicit paths win over credentials.
+	c, err = FromEnv(env(map[string]string{
+		"CREDENTIALS_DIRECTORY": dir, "HORUS_API_TLS_CERT": "/x.crt", "HORUS_API_TLS_KEY": "/x.key",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TLSCert != "/x.crt" || c.TLSKey != "/x.key" {
+		t.Fatalf("explicit tls: %q %q", c.TLSCert, c.TLSKey)
+	}
+
+	// Only one of the two credentials is a configuration error.
+	if err := os.Remove(filepath.Join(dir, "api-tls-key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FromEnv(env(map[string]string{"CREDENTIALS_DIRECTORY": dir})); err == nil {
+		t.Fatal("expected error for a cert credential without key")
+	}
+}

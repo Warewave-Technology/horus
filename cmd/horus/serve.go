@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -123,13 +124,24 @@ func runServe() error {
 		go func() { httpErr <- s.Serve(l) }()
 	}
 	if cfg.APIListen != "" {
+		// Load the key pair before binding so a bad certificate fails the
+		// start instead of surfacing after READY=1.
+		var tlsConf *tls.Config
+		if cfg.TLSCert != "" {
+			cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+			if err != nil {
+				return fmt.Errorf("api tls: %w", err)
+			}
+			tlsConf = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+		}
 		l, err := net.Listen("tcp", cfg.APIListen)
 		if err != nil {
 			return fmt.Errorf("api listen %s: %w", cfg.APIListen, err)
 		}
 		s := newHTTP()
-		if cfg.TLSCert != "" {
-			go func() { httpErr <- s.ServeTLS(l, cfg.TLSCert, cfg.TLSKey) }()
+		if tlsConf != nil {
+			s.TLSConfig = tlsConf
+			go func() { httpErr <- s.ServeTLS(l, "", "") }()
 		} else {
 			log.Warn("API TCP listener has no TLS; bearer tokens travel in clear text", "addr", cfg.APIListen)
 			go func() { httpErr <- s.Serve(l) }()

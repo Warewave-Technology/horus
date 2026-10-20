@@ -20,8 +20,8 @@ type Config struct {
 
 	APIListen  string // HORUS_API_LISTEN, TCP for operators, e.g. ":8053"; empty disables
 	APISocket  string // HORUS_API_SOCKET, unix socket for the CLI; "none" disables
-	TLSCert    string // HORUS_API_TLS_CERT
-	TLSKey     string // HORUS_API_TLS_KEY
+	TLSCert    string // HORUS_API_TLS_CERT, or $CREDENTIALS_DIRECTORY/api-tls-cert
+	TLSKey     string // HORUS_API_TLS_KEY, or $CREDENTIALS_DIRECTORY/api-tls-key
 	AdminToken string // read from HORUS_ADMIN_TOKEN_FILE or $CREDENTIALS_DIRECTORY/admin-token
 
 	DBPath    string // HORUS_DB
@@ -138,6 +138,21 @@ func FromEnv(getenv func(string) string) (Config, error) {
 		c.AdminToken = strings.TrimSpace(string(b))
 	}
 
+	// API TLS: explicit paths, else systemd credentials (LoadCredential=
+	// api-tls-cert / api-tls-key), which keeps the key readable under
+	// DynamicUser=yes without loosening its file permissions.
+	if dir := getenv("CREDENTIALS_DIRECTORY"); dir != "" && c.TLSCert == "" && c.TLSKey == "" {
+		for _, cred := range []struct {
+			name string
+			dst  *string
+		}{{"api-tls-cert", &c.TLSCert}, {"api-tls-key", &c.TLSKey}} {
+			p := filepath.Join(dir, cred.name)
+			if _, err := os.Stat(p); err == nil {
+				*cred.dst = p
+			}
+		}
+	}
+
 	if len(errs) > 0 {
 		return c, fmt.Errorf("config: %s", strings.Join(errs, "; "))
 	}
@@ -159,7 +174,7 @@ func (c Config) Validate() error {
 		errs = append(errs, "at least one of HORUS_API_LISTEN or HORUS_API_SOCKET is required")
 	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {
-		errs = append(errs, "HORUS_API_TLS_CERT and HORUS_API_TLS_KEY must be set together")
+		errs = append(errs, "HORUS_API_TLS_CERT and HORUS_API_TLS_KEY (or credentials api-tls-cert and api-tls-key) must be set together")
 	}
 	if len(c.AdminToken) < 32 {
 		errs = append(errs, "admin token missing or shorter than 32 characters (HORUS_ADMIN_TOKEN_FILE or systemd credential admin-token)")
