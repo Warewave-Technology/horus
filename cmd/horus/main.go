@@ -22,9 +22,12 @@ Usage:
   horus [global flags] zone add <zone> [--ttl N]
   horus [global flags] zone rm <zone>
 
-  horus [global flags] record ls [zone]
+  horus [global flags] record ls [zone] [--owner OWNER]
   horus [global flags] record add <name> <A|AAAA|CNAME> <data> [--ttl N]
   horus [global flags] record rm <id>
+
+  horus [global flags] owners [zone] [--owner OWNER]      who holds which names
+      OWNER: manual, <cluster>, <cluster>/<namespace> or <cluster>/<namespace>/<ingress>
 
   horus [global flags] cluster ls
   horus [global flags] cluster add <id> --zone <zone>     prints the cluster token once
