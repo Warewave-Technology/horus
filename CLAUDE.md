@@ -9,7 +9,10 @@ do not change those without asking.
 
 Everything compiles against the real dependencies (Go 1.26, miekg/dns,
 modernc.org/sqlite, controller-runtime). `make vet test operator-test` and
-`make e2e` (kind) pass. Nothing is deployed yet; there is no CI.
+`make e2e` (kind) pass. CI and releases run on GitHub Actions with
+self-hosted runners (`.github/workflows`, see "Versioning and releases" in
+README.md): `ci` on main/PRs, `release` on `v*.*.*` tags (binaries, GHCR
+image, GitHub release).
 
 Local smoke test without root (macOS: port 5353 is taken by mDNSResponder,
 and unix socket paths must stay under 104 bytes):
@@ -56,8 +59,8 @@ make e2e             # kind e2e (docker, kind, kubectl, dig); KEEP=1 keeps it up
 
 ## Known gaps / next steps
 
-- CI (deliberately none yet). When added: `make vet test operator-test`;
-  `make e2e` needs docker + kind on the runner.
+- `make e2e` is not in CI (needs kind, dig and a host-reachable horus on the
+  runner); run it locally before releases touching the operator or DNS.
 - `GetEventRecorderFor` is deprecated in recent controller-runtime; it still
   compiles, keep it until it does not.
 - `horus backup` twice within one second fails (same file name); harmless

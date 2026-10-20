@@ -612,7 +612,7 @@ kubectl -n horus-system create secret generic horus-operator-token \
 The image is published for `linux/amd64` and `linux/arm64`:
 
 ```
-ghcr.io/warewave-technology/horus-operator:v0.1.0     # a release
+ghcr.io/warewave-technology/horus-operator:v0.1.1     # a release (pin this)
 ghcr.io/warewave-technology/horus-operator:latest     # newest release
 ```
 
@@ -621,7 +621,7 @@ imports `../pkg`):
 
 ```sh
 make operator-image VERSION=dev                                       # local, current platform
-make operator-push VERSION=v0.1.0 IMAGE=registry.example.com/horus-operator   # multi-arch, pushed
+make operator-push VERSION=v0.1.1 IMAGE=registry.example.com/horus-operator   # multi-arch, pushed
 ```
 
 Edit [`operator/config/operator.yaml`](operator/config/operator.yaml): set
@@ -979,14 +979,64 @@ docs/                   DESIGN.md, API.md
 ## Versioning and releases
 
 Releases are git tags `vMAJOR.MINOR.PATCH`
-([semantic versioning](https://semver.org/)). Before 1.0, minor versions may
-change the API or behavior. Each
-[release](https://github.com/Warewave-Technology/horus/releases) has notes
-and static Linux binaries (`amd64`, `arm64`) of `horus` and
-`horus-operator`. The operator image is published to
-`ghcr.io/warewave-technology/horus-operator:<tag>` (multi-arch) with
-`make operator-push VERSION=<tag>`, which also moves `:latest` for release
-tags.
+([semantic versioning](https://semver.org/)); `vX.Y.Z-rc.N` and similar are
+published as pre-releases. Before 1.0, minor versions may change the API or
+behavior. Each [release](https://github.com/Warewave-Technology/horus/releases)
+has generated notes, static Linux binaries (`amd64`, `arm64`) of `horus` and
+`horus-operator` with a `SHA256SUMS` file, and the multi-arch operator image
+`ghcr.io/warewave-technology/horus-operator:<tag>`. `:latest` points to the
+newest non-pre-release.
+
+`v0.1.0` predates the pipeline: it has binaries but no image. Use `v0.1.1` or
+later for the operator.
+
+### CI
+
+GitHub Actions, on the organization's self-hosted runners
+([`.github/workflows`](.github/workflows)):
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `ci` | push to `main`, pull requests, manual, called by `release` | `gofmt`, `go.mod` tidy check, `make vet test operator-test build operator` inside a `golang:1.26` container |
+| `release` | tag `v*.*.*` | runs `ci`, then in parallel builds the binaries (and checks that `horus version` prints the tag) and pushes the image to GHCR with `GITHUB_TOKEN`; finally creates the GitHub release with the binaries attached |
+
+Requirements for the runners:
+
+- Linux with Docker. Jobs run in job containers, and the image is built with
+  buildx. Go and gcc come from the container. The Dockerfile cross-compiles,
+  so no QEMU is needed for the second architecture.
+- The organization runner group must allow **public repositories**
+  (Organization settings → Actions → Runner groups). Otherwise jobs wait in
+  the queue forever.
+- Labels: jobs use `["self-hosted","linux"]`. Override this with the
+  repository variable `RUNNER_LABELS`, a JSON array, for example
+  `gh variable set RUNNER_LABELS --body '["self-hosted","linux","x64"]'`.
+- Pull requests from forks are skipped on purpose, because their code would
+  run on the self-hosted runners. Also keep "Require approval for all
+  outside collaborators" enabled in the repository's Actions settings.
+
+`make e2e` is not part of CI. Run it before releases that touch the operator
+or DNS behavior.
+
+### Cutting a release
+
+```sh
+# 1. main is green in CI; update the image tag in operator/config/operator.yaml
+sed -i '' 's#horus-operator:v[0-9.]*#horus-operator:v0.2.0#' operator/config/operator.yaml   # GNU sed: sed -i
+git commit -am "Release v0.2.0"
+git push
+
+# 2. tag and push; the release workflow does the rest
+git tag -a v0.2.0 -m "horus v0.2.0"
+git push origin v0.2.0
+gh run watch "$(gh run list --workflow release --limit 1 --json databaseId --jq '.[0].databaseId')"
+```
+
+GHCR creates the package as **private** on its first push. Make it public
+once (package page → Package settings → Change visibility). Otherwise
+clusters need an image pull secret. Fixing a broken release: delete the
+release and the tag (`gh release delete vX.Y.Z --cleanup-tag`), fix the
+problem, and tag again. Never move a tag that has already been pulled.
 
 ## License
 

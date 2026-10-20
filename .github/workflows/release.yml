@@ -1,0 +1,134 @@
+name: release
+
+# Push a tag vX.Y.Z (or vX.Y.Z-rc.1 for a pre-release) to publish:
+#   - static Linux binaries (amd64, arm64) of horus and horus-operator + SHA256SUMS
+#   - the multi-arch image ghcr.io/warewave-technology/horus-operator:<tag>
+#     (and :latest for non-pre-releases)
+#   - a GitHub release with generated notes
+# The runner needs Docker (job containers and buildx). See ci.yml for RUNNER_LABELS.
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  IMAGE: ghcr.io/warewave-technology/horus-operator
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  binaries:
+    needs: ci
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS || '["self-hosted","linux"]') }}
+    container: golang:1.26
+    timeout-minutes: 20
+    env:
+      GOCACHE: /go/cache/build
+      GOMODCACHE: /go/pkg/mod
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /go/cache/build
+            /go/pkg/mod
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'operator/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: build
+        run: |
+          set -eu
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch make build operator BIN=dist/$arch VERSION="$VERSION"
+            mv "dist/$arch/horus" "dist/horus_${VERSION}_linux_$arch"
+            mv "dist/$arch/horus-operator" "dist/horus-operator_${VERSION}_linux_$arch"
+            rmdir "dist/$arch"
+          done
+          cd dist && sha256sum horus* > SHA256SUMS && cat SHA256SUMS
+
+      - name: check embedded version
+        run: |
+          out=$(./dist/horus_${VERSION}_linux_$(go env GOARCH) version)
+          [ "$out" = "$VERSION" ] || { echo "horus version printed '$out', want '$VERSION'"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    needs: ci
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS || '["self-hosted","linux"]') }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      # The Dockerfile cross-compiles on the build platform, so both
+      # architectures build without QEMU.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: operator/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: true
+
+  release:
+    needs: [binaries, image]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS || '["self-hosted","linux"]') }}
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: horus ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body: |
+            Operator image (linux/amd64, linux/arm64):
+
+                ghcr.io/warewave-technology/horus-operator:${{ github.ref_name }}
+
+            Binaries: static Linux builds below; verify with `sha256sum -c SHA256SUMS`.
+            Installation and upgrade notes: see the [README](https://github.com/${{ github.repository }}#readme).
+          files: dist/*
+          fail_on_unmatched_files: true

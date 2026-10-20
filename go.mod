@@ -2,7 +2,6 @@ module github.com/Warewave-Technology/horus
 
 go 1.26.0
 
-
 require (
 	github.com/miekg/dns v1.1.73
 	modernc.org/sqlite v1.60.1
