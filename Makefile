@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 BIN     := bin
 
-.PHONY: all tidy build test vet operator operator-test operator-image e2e install clean
+.PHONY: all tidy build test vet operator operator-test operator-image operator-push e2e install clean
 
 all: vet test build operator
 
@@ -28,6 +28,14 @@ operator-test:
 
 operator-image:
 	docker build -f operator/Dockerfile --build-arg VERSION=$(VERSION) -t horus-operator:$(VERSION) .
+
+# Multi-arch build + push (needs `docker login ghcr.io` with write:packages).
+# Tags :$(VERSION), and :latest when VERSION is a release tag (vX.Y.Z).
+IMAGE ?= ghcr.io/warewave-technology/horus-operator
+PLATFORMS ?= linux/amd64,linux/arm64
+operator-push:
+	docker buildx build --platform $(PLATFORMS) -f operator/Dockerfile --build-arg VERSION=$(VERSION) \
+		-t $(IMAGE):$(VERSION) $(if $(filter v%,$(VERSION)),$(if $(findstring -,$(VERSION)),,-t $(IMAGE):latest)) --push .
 
 # End-to-end test against a throwaway kind cluster (needs docker, kind,
 # kubectl, dig, openssl). KEEP=1 leaves everything running.

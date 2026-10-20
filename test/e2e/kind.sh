@@ -134,7 +134,7 @@ kubectl -n horus-system create secret generic horus-operator-token \
 	--from-literal=token="$TOKEN" --from-file=ca.crt="$WORK/creds/api-tls-cert" \
 	--dry-run=client -o yaml | kubectl apply -f -
 IMAGE=$IMAGE URL=https://$HORUS_E2E_HOST:$API_PORT perl -pe '
-	s#registry.example.com/horus-operator:dev#$ENV{IMAGE}#;
+	s#^(\s+image: )\S+#$1$ENV{IMAGE}#;
 	s#https://horus.internal.example:8053#$ENV{URL}#;
 	s#^(\s+)- --leader-elect$#$1- --leader-elect\n$1- --ca-file=/var/run/secrets/horus/ca.crt\n$1- --gc-interval=5s#;
 ' "$ROOT/operator/config/operator.yaml" | kubectl apply -f -

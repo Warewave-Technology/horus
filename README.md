@@ -609,13 +609,19 @@ kubectl -n horus-system create secret generic horus-operator-token \
 #   add  --ca-file=/var/run/secrets/horus/ca.crt  to the container args.
 ```
 
-Build and push the image (from the repository root, because the operator
-module imports `../pkg`):
+The image is published for `linux/amd64` and `linux/arm64`:
+
+```
+ghcr.io/warewave-technology/horus-operator:v0.1.0     # a release
+ghcr.io/warewave-technology/horus-operator:latest     # newest release
+```
+
+To build your own (from the repository root, because the operator module
+imports `../pkg`):
 
 ```sh
-make operator-image VERSION=v0.1.0
-docker tag horus-operator:v0.1.0 registry.example.com/horus-operator:v0.1.0
-docker push registry.example.com/horus-operator:v0.1.0
+make operator-image VERSION=dev                                       # local, current platform
+make operator-push VERSION=v0.1.0 IMAGE=registry.example.com/horus-operator   # multi-arch, pushed
 ```
 
 Edit [`operator/config/operator.yaml`](operator/config/operator.yaml): set
@@ -977,8 +983,10 @@ Releases are git tags `vMAJOR.MINOR.PATCH`
 change the API or behavior. Each
 [release](https://github.com/Warewave-Technology/horus/releases) has notes
 and static Linux binaries (`amd64`, `arm64`) of `horus` and
-`horus-operator`. Build the operator image yourself with
-`make operator-image`; no image is published.
+`horus-operator`. The operator image is published to
+`ghcr.io/warewave-technology/horus-operator:<tag>` (multi-arch) with
+`make operator-push VERSION=<tag>`, which also moves `:latest` for release
+tags.
 
 ## License
 

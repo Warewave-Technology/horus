@@ -7,7 +7,7 @@
 #      kubectl -n horus-system create secret generic horus-operator-token --from-literal=token=<token>
 #      (and, if horus uses a private CA: --from-file=ca.crt=<ca.pem>; then
 #       add --ca-file=/var/run/secrets/horus/ca.crt to args below).
-#   3. Set HORUS_URL and the image below.
+#   3. Set HORUS_URL below (and the image tag, if not this release).
 ---
 apiVersion: v1
 kind: Namespace
@@ -100,7 +100,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
-          image: registry.example.com/horus-operator:dev   # CHANGE ME
+          image: ghcr.io/warewave-technology/horus-operator:v0.1.0   # CHANGE ME (pin a release)
           args:
             - --leader-elect
           env:
