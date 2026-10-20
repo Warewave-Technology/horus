@@ -11,7 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/warewave/horus/pkg/ingressdns"
+	"github.com/Warewave-Technology/horus/pkg/ingressdns"
 )
 
 // GarbageCollector periodically removes server-side owners whose Ingress no

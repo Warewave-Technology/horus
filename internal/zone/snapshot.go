@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 // maxCNAMEChain bounds in-zone CNAME chasing (loops are possible: a -> b -> a).

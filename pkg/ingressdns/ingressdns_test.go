@@ -3,7 +3,7 @@ package ingressdns
 import (
 	"testing"
 
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 const zone = "prod.internal.example."

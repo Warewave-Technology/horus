@@ -23,9 +23,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	horus "github.com/warewave/horus/pkg/client"
+	horus "github.com/Warewave-Technology/horus/pkg/client"
 
-	"github.com/warewave/horus/operator/internal/controller"
+	"github.com/Warewave-Technology/horus/operator/internal/controller"
 )
 
 var version = "dev"

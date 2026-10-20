@@ -13,13 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/warewave/horus/internal/config"
-	"github.com/warewave/horus/internal/dnsserver"
-	"github.com/warewave/horus/internal/httpapi"
-	"github.com/warewave/horus/internal/metrics"
-	"github.com/warewave/horus/internal/sdnotify"
-	"github.com/warewave/horus/internal/store"
-	"github.com/warewave/horus/internal/zone"
+	"github.com/Warewave-Technology/horus/internal/config"
+	"github.com/Warewave-Technology/horus/internal/dnsserver"
+	"github.com/Warewave-Technology/horus/internal/httpapi"
+	"github.com/Warewave-Technology/horus/internal/metrics"
+	"github.com/Warewave-Technology/horus/internal/sdnotify"
+	"github.com/Warewave-Technology/horus/internal/store"
+	"github.com/Warewave-Technology/horus/internal/zone"
 )
 
 func runServe() error {

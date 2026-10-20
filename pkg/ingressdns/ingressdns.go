@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 // Annotation keys. All live under one prefix.

@@ -1,4 +1,4 @@
-module github.com/warewave/horus
+module github.com/Warewave-Technology/horus
 
 go 1.26.0
 

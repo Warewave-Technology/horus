@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 //go:embed schema.sql

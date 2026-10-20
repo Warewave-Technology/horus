@@ -1,4 +1,4 @@
-module github.com/warewave/horus/operator
+module github.com/Warewave-Technology/horus/operator
 
 go 1.26.0
 
@@ -7,7 +7,7 @@ go 1.26.0
 // pkg/ingressdns with the server through this replace directive.
 
 require (
-	github.com/warewave/horus v0.0.0-00010101000000-000000000000
+	github.com/Warewave-Technology/horus v0.0.0-00010101000000-000000000000
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
 	k8s.io/client-go v0.37.1
@@ -76,4 +76,4 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-replace github.com/warewave/horus => ../
+replace github.com/Warewave-Technology/horus => ../

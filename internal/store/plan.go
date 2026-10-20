@@ -3,7 +3,7 @@ package store
 import (
 	"sort"
 
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 // replacePlan is what ReplaceOwner will do inside its transaction.

@@ -10,9 +10,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/warewave/horus/internal/store"
-	"github.com/warewave/horus/pkg/api"
-	"github.com/warewave/horus/pkg/client"
+	"github.com/Warewave-Technology/horus/internal/store"
+	"github.com/Warewave-Technology/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/client"
 )
 
 // fakeStore is an in-memory Store good enough to exercise routing, auth and

@@ -3,7 +3,7 @@ package store
 import (
 	"testing"
 
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 func rec(id int64, name string, typ api.RecordType, data, owner string, ttl uint32) api.Record {

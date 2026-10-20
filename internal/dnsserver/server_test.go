@@ -8,8 +8,8 @@ import (
 
 	"github.com/miekg/dns"
 
-	"github.com/warewave/horus/internal/zone"
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/internal/zone"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 // fakeUpstream answers A queries for ext.example.com. and lb.cloud.example.com.

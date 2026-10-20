@@ -15,8 +15,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"github.com/warewave/horus/pkg/api"
-	"github.com/warewave/horus/pkg/ingressdns"
+	"github.com/Warewave-Technology/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/ingressdns"
 )
 
 type fakeHorus struct {

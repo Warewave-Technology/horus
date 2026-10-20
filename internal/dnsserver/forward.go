@@ -11,8 +11,8 @@ import (
 
 	"github.com/miekg/dns"
 
-	"github.com/warewave/horus/internal/cache"
-	"github.com/warewave/horus/internal/metrics"
+	"github.com/Warewave-Technology/horus/internal/cache"
+	"github.com/Warewave-Technology/horus/internal/metrics"
 )
 
 // Forwarder resolves non-authoritative queries via upstream resolvers, with a

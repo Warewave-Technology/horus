@@ -3,7 +3,7 @@ package zone
 import (
 	"testing"
 
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 func testSnapshot() *Snapshot {

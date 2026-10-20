@@ -17,9 +17,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	"github.com/warewave/horus/pkg/api"
-	horus "github.com/warewave/horus/pkg/client"
-	"github.com/warewave/horus/pkg/ingressdns"
+	"github.com/Warewave-Technology/horus/pkg/api"
+	horus "github.com/Warewave-Technology/horus/pkg/client"
+	"github.com/Warewave-Technology/horus/pkg/ingressdns"
 )
 
 // Horus is the subset of the horus API client the operator uses.

@@ -24,8 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/warewave/horus/internal/store"
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/internal/store"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 // Store is what the API needs from persistence. *store.Store implements it.

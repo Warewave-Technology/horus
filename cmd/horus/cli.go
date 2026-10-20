@@ -15,8 +15,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/warewave/horus/pkg/api"
-	"github.com/warewave/horus/pkg/client"
+	"github.com/Warewave-Technology/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/pkg/client"
 )
 
 type cli struct {

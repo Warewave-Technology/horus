@@ -11,9 +11,9 @@ import (
 
 	"github.com/miekg/dns"
 
-	"github.com/warewave/horus/internal/metrics"
-	"github.com/warewave/horus/internal/zone"
-	"github.com/warewave/horus/pkg/api"
+	"github.com/Warewave-Technology/horus/internal/metrics"
+	"github.com/Warewave-Technology/horus/internal/zone"
+	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
 // ednsSize is the EDNS0 UDP payload size we advertise and request
