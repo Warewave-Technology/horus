@@ -1032,9 +1032,11 @@ git push origin v0.2.0
 gh run watch "$(gh run list --workflow release --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
 
-GHCR creates the package as **private** on its first push. Make it public
-once (package page → Package settings → Change visibility). Otherwise
-clusters need an image pull secret. Fixing a broken release: delete the
+The image is linked to this repository through its OCI `source` label and
+inherits its public visibility, so clusters pull it without credentials. If
+the organization's package settings ever make it private, change it on the
+package page (Package settings → Change visibility) or give the clusters an
+image pull secret. Fixing a broken release: delete the
 release and the tag (`gh release delete vX.Y.Z --cleanup-tag`), fix the
 problem, and tag again. Never move a tag that has already been pulled.
 
