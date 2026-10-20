@@ -634,7 +634,7 @@ kubectl -n horus-system create secret generic horus-operator-token \
 The image is published for `linux/amd64` and `linux/arm64`:
 
 ```
-ghcr.io/warewave-technology/horus-operator:v0.1.1     # a release (pin this)
+ghcr.io/warewave-technology/horus-operator:v0.2.0     # a release (pin this)
 ghcr.io/warewave-technology/horus-operator:latest     # newest release
 ```
 
