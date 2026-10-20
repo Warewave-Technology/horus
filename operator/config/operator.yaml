@@ -1,0 +1,142 @@
+# horus-operator — one per cluster.
+#
+# Before applying:
+#   1. On the horus host:  horus cluster add <cluster-id> --zone <zone>
+#      and copy the printed token.
+#   2. kubectl create namespace horus-system
+#      kubectl -n horus-system create secret generic horus-operator-token --from-literal=token=<token>
+#      (and, if horus uses a private CA: --from-file=ca.crt=<ca.pem>; then
+#       add --ca-file=/var/run/secrets/horus/ca.crt to args below).
+#   3. Set HORUS_URL and the image below.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: horus-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: horus-operator
+  namespace: horus-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: horus-operator
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: horus-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: horus-operator
+subjects:
+  - kind: ServiceAccount
+    name: horus-operator
+    namespace: horus-system
+---
+# Leader election (namespaced).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: horus-operator-leader-election
+  namespace: horus-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: horus-operator-leader-election
+  namespace: horus-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: horus-operator-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: horus-operator
+    namespace: horus-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: horus-operator
+  namespace: horus-system
+  labels:
+    app.kubernetes.io/name: horus-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: horus-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: horus-operator
+    spec:
+      serviceAccountName: horus-operator
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: registry.example.com/horus-operator:dev   # CHANGE ME
+          args:
+            - --leader-elect
+          env:
+            - name: HORUS_URL
+              value: https://horus.internal.example:8053    # CHANGE ME
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: probes
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+            initialDelaySeconds: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: horus-token
+              mountPath: /var/run/secrets/horus
+              readOnly: true
+      volumes:
+        - name: horus-token
+          secret:
+            secretName: horus-operator-token

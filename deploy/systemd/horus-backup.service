@@ -1,0 +1,12 @@
+[Unit]
+Description=horus database backup
+Requires=horus.service
+After=horus.service
+
+[Service]
+Type=oneshot
+# Runs as root to read /etc/horus/admin.token; the copy is written by the
+# horus service itself into HORUS_BACKUP_DIR (VACUUM INTO).
+ExecStart=/usr/local/bin/horus backup
+# Keep the 14 newest backups.
+ExecStartPost=/bin/sh -c 'ls -1t /var/lib/horus/backups/horus-*.db 2>/dev/null | tail -n +15 | xargs -r rm -f'

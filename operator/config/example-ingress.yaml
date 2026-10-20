@@ -1,0 +1,27 @@
+# An Ingress that horus-operator registers.
+# Result (cluster zone prod.internal.example.):
+#   web.prod.internal.example.  A  <status.loadBalancer.ingress[].ip>  TTL 60
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: default
+  annotations:
+    horus.warewave.tech/register: "true"
+    # Optional:
+    horus.warewave.tech/ttl: "60"
+    # horus.warewave.tech/hostnames: "a.prod.internal.example,b.prod.internal.example"
+    # horus.warewave.tech/target: "10.20.0.15"          # IPs -> A/AAAA, one hostname -> CNAME
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: web.prod.internal.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80
