@@ -633,7 +633,13 @@ func (s *Store) DeleteCluster(ctx context.Context, actor, id string) error {
 	})
 }
 
-// ClusterByTokenHash authenticates a cluster token and records last_seen.
+// lastSeenInterval limits how often authentication writes clusters.last_seen:
+// operators call the API on every reconcile and readiness probe, and a
+// minute's precision is plenty for "is this cluster still talking to us".
+const lastSeenInterval = time.Minute
+
+// ClusterByTokenHash authenticates a cluster token and records last_seen
+// (at most once per lastSeenInterval).
 func (s *Store) ClusterByTokenHash(ctx context.Context, tokenHash []byte) (api.Cluster, error) {
 	var c api.Cluster
 	err := s.db.QueryRowContext(ctx,
@@ -646,7 +652,12 @@ func (s *Store) ClusterByTokenHash(ctx context.Context, tokenHash []byte) (api.C
 		return c, err
 	}
 	// Best effort; a failed last_seen update must not fail authentication.
-	_, _ = s.db.ExecContext(ctx, `UPDATE clusters SET last_seen = ? WHERE id = ?`, s.ts(), c.ID)
+	// This bookkeeping write bypasses httpapi's write lock on purpose: it
+	// changes nothing the DNS snapshot depends on.
+	ts := s.ts()
+	_, _ = s.db.ExecContext(ctx,
+		`UPDATE clusters SET last_seen = ? WHERE id = ? AND (last_seen IS NULL OR last_seen <= ?)`,
+		ts, c.ID, ts-int64(lastSeenInterval/time.Second))
 	return c, nil
 }
 

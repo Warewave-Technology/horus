@@ -84,7 +84,11 @@ func runServe() error {
 	})
 	dnsLn, err := dnsserver.Listen(cfg.DNSListen, handler)
 	if err != nil {
-		return fmt.Errorf("dns listen %s: %w (is systemd-resolved's stub listener on :53? see docs/DESIGN.md)", cfg.DNSListen, err)
+		err = fmt.Errorf("dns listen %s: %w", cfg.DNSListen, err)
+		if _, port, _ := net.SplitHostPort(cfg.DNSListen); port == "53" && errors.Is(err, syscall.EADDRINUSE) {
+			err = fmt.Errorf("%w (is systemd-resolved's stub listener on :53? see docs/DESIGN.md)", err)
+		}
+		return err
 	}
 
 	// ---- API

@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Set via -ldflags "-X main.version=...".
@@ -44,7 +45,12 @@ Global flags (or env):
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "horus:", err)
+		// API errors already start with "horus: ".
+		msg := err.Error()
+		if !strings.HasPrefix(msg, "horus: ") {
+			msg = "horus: " + msg
+		}
+		fmt.Fprintln(os.Stderr, msg)
 		os.Exit(1)
 	}
 }

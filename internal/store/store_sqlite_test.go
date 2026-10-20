@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -125,5 +126,48 @@ func TestBackup(t *testing.T) {
 	zones, err := b.ListZones(ctx)
 	if err != nil || len(zones) != 1 {
 		t.Fatalf("backup content: %v %v", zones, err)
+	}
+}
+
+func TestLastSeenIsThrottled(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	now := time.Unix(1_000_000, 0)
+	s.now = func() time.Time { return now }
+	if _, err := s.CreateZone(ctx, "admin", api.Zone{Name: "prod.example"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateCluster(ctx, "admin", "prod", "prod.example", []byte("h")); err != nil {
+		t.Fatal(err)
+	}
+	lastSeen := func() int64 {
+		t.Helper()
+		cs, err := s.ListClusters(ctx)
+		if err != nil || len(cs) != 1 {
+			t.Fatalf("clusters: %v %v", cs, err)
+		}
+		return cs[0].LastSeen
+	}
+	auth := func() {
+		t.Helper()
+		if _, err := s.ClusterByTokenHash(ctx, []byte("h")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	auth()
+	if got := lastSeen(); got != now.Unix() {
+		t.Fatalf("first auth: last_seen=%d", got)
+	}
+	first := now.Unix()
+	now = now.Add(lastSeenInterval - time.Second)
+	auth()
+	if got := lastSeen(); got != first {
+		t.Fatalf("within the interval last_seen must not move: %d", got)
+	}
+	now = now.Add(time.Second)
+	auth()
+	if got := lastSeen(); got != now.Unix() {
+		t.Fatalf("after the interval: last_seen=%d, want %d", got, now.Unix())
 	}
 }

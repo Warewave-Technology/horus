@@ -1,6 +1,6 @@
 # Build from the REPOSITORY ROOT (the operator imports ../pkg via a replace):
 #   docker build -f operator/Dockerfile -t registry.example.com/horus-operator:dev .
-FROM golang:1.24 AS build
+FROM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum* ./
 COPY pkg/ pkg/
