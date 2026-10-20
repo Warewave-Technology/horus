@@ -6,7 +6,7 @@
 #   make e2e                 # or: test/e2e/kind.sh
 #   KEEP=1 make e2e          # keep the kind cluster and horus running afterwards
 #
-# Needs: go, docker, kind, kubectl, dig, openssl, curl.
+# Needs: go, docker, kind, kubectl >= 1.24, dig, openssl, curl, perl.
 # Uses its own kubeconfig, so the current kubectl context is never touched.
 #
 # Environment:
@@ -57,7 +57,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for bin in go docker kind kubectl dig openssl curl; do
+for bin in go docker kind kubectl dig openssl curl perl; do
 	command -v "$bin" >/dev/null || fail "$bin not found"
 done
 
