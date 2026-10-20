@@ -23,15 +23,16 @@ pkg/api/                wire types + validation (shared with the operator)
 pkg/client/             Go API client (CLI + operator)
 pkg/ingressdns/         Ingress -> desired records (pure, shared)
 operator/               Kubernetes operator (separate Go module)
-deploy/systemd/         units + env example
+deploy/systemd/         units, env example, TLS drop-in
+test/e2e/               kind end-to-end test (make e2e)
 docs/                   DESIGN.md, API.md
 ```
 
 ## Quick start
 
 ```sh
-make tidy          # fetch dependencies (first time)
-make vet test operator-test
+make vet test operator-test   # Go 1.26+
+make e2e                      # optional: kind e2e (docker, kind, kubectl, dig)
 sudo make install  # binary, unit, /etc/horus/{horus.env,admin.token}
 sudo systemctl enable --now horus horus-backup.timer
 
@@ -40,6 +41,11 @@ sudo horus record add db.prod.internal.example A 10.0.0.5
 dig @127.0.0.1 db.prod.internal.example
 
 sudo horus cluster add prod --zone prod.internal.example   # token for the operator
+sudo horus owners                                          # who holds which names
 ```
+
+The operator API (`HORUS_API_LISTEN`) should use TLS: put the cert and key at
+`/etc/horus/tls/tls.{crt,key}` before `make install` (it then installs
+`deploy/systemd/horus-tls.conf`). See "Operations" in `docs/DESIGN.md`.
 
 Operator deployment: see `operator/config/operator.yaml` and `docs/DESIGN.md`.

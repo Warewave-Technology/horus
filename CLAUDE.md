@@ -5,43 +5,17 @@ Small internal DNS server in Go + a Kubernetes operator. Read `docs/DESIGN.md`
 changing behavior. The "Decisions" table in DESIGN.md is agreed with the owner;
 do not change those without asking.
 
-## Current state (read this first)
+## Current state
 
-The skeleton was written in a sandbox **without access to the Go module
-proxy**, so third-party dependencies were never downloaded.
+Everything compiles against the real dependencies (Go 1.26, miekg/dns,
+modernc.org/sqlite, controller-runtime). `make vet test operator-test` and
+`make e2e` (kind) pass. Nothing is deployed yet; there is no CI.
 
-Verified there (`go vet` + `go test` pass, stdlib only):
-- `pkg/api`, `pkg/client`, `pkg/ingressdns`
-- `internal/zone`, `internal/cache`, `internal/config`, `internal/sdnotify`,
-  `internal/metrics`, `internal/httpapi` (end-to-end with pkg/client, fake store)
-- `internal/store` pure logic (`plan_test.go`)
-- `cmd/horus` CLI code typechecked with `serve` stubbed out
-- systemd units pass `systemd-analyze verify`; manifests are valid YAML
-
-**Not compiled against the real dependencies:**
-- `internal/dnsserver`, `cmd/horus` (serve) and all test files were
-  typechecked (`go vet`) against a hand-written stub of the miekg/dns API
-  surface they use. That catches our own mistakes, not mismatches with the
-  real library, and none of their tests have run.
-- `internal/store/store_sqlite_test.go` (modernc.org/sqlite) never ran.
-- Everything under `operator/` (controller-runtime) is only syntax-checked.
-Expect small fixes.
-
-### First tasks, in order
-
-1. `go mod tidy` in the repo root and in `operator/`.
-2. `go vet ./... && go test -race ./...` in the root. Fix compile errors in
-   `internal/dnsserver` and `cmd/horus` first, then make
-   `internal/store/store_sqlite_test.go` and `internal/dnsserver/server_test.go`
-   pass. Don't weaken tests to make them pass; fix the code unless the test is
-   genuinely wrong (then say why).
-3. `cd operator && go vet ./... && go test -race ./...`.
-   `GetEventRecorderFor` may be deprecated in recent controller-runtime; keep it
-   unless it no longer compiles.
-4. Local smoke test without root: run `horus serve` with
-   `HORUS_DNS_LISTEN=127.0.0.1:5353 HORUS_API_SOCKET=$PWD/api.sock HORUS_DB=$PWD/dev.db HORUS_ADMIN_TOKEN_FILE=<file with 40 chars>`,
-   then `HORUS_ADDR=unix://$PWD/api.sock horus zone add ...` and
-   `dig @127.0.0.1 -p 5353 ...`. Check forwarding, NXDOMAIN+SOA, CNAME chase.
+Local smoke test without root (macOS: port 5353 is taken by mDNSResponder,
+and unix socket paths must stay under 104 bytes):
+`HORUS_DNS_LISTEN=127.0.0.1:15353 HORUS_API_SOCKET=$PWD/api.sock HORUS_DB=$PWD/dev.db HORUS_ADMIN_TOKEN_FILE=<file with 40 chars> horus serve`,
+then `HORUS_ADDR=unix://$PWD/api.sock HORUS_TOKEN_FILE=<same file> horus zone add ...`
+and `dig @127.0.0.1 -p 15353 ...`.
 
 ## Commands
 
@@ -50,6 +24,7 @@ make tidy            # go mod tidy (root + operator)
 make vet test        # root module
 make operator-test   # operator module
 make build operator  # bin/horus, bin/horus-operator
+make e2e             # kind e2e (docker, kind, kubectl, dig); KEEP=1 keeps it up
 ```
 
 ## Layout and boundaries
@@ -79,12 +54,11 @@ make build operator  # bin/horus, bin/horus-operator
 - Tests next to code, table-driven where it helps. `go test -race` must pass.
 - Code, comments and docs in English.
 
-## Known gaps / next steps (not started)
+## Known gaps / next steps
 
-- TLS for the API listener with `DynamicUser=yes`: cert/key readability
-  (probably `LoadCredential=` for cert and key too). Document the chosen way.
-- e2e test with kind: horus on the host, operator in kind, real Ingress with a
-  fake LB status → `dig` resolves.
-- `horus record ls` could filter by owner; `horus owners` admin view.
-- Module path `github.com/warewave/horus` is a placeholder; change it in
-  `go.mod`, `operator/go.mod` and imports if the repo lives elsewhere.
+- CI (deliberately none yet). When added: `make vet test operator-test`;
+  `make e2e` needs docker + kind on the runner.
+- `GetEventRecorderFor` is deprecated in recent controller-runtime; it still
+  compiles, keep it until it does not.
+- `horus backup` twice within one second fails (same file name); harmless
+  for the daily timer.
