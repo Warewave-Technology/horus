@@ -1,4 +1,4 @@
--- horus schema, version 1.
+-- horus schema, version 1 (frozen: change the schema with a new migrate_vN.sql).
 -- Applied by store.Open inside a transaction when PRAGMA user_version < 1.
 
 CREATE TABLE zones (

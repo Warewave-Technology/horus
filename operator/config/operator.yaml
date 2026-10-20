@@ -1,8 +1,9 @@
 # horus-operator — one per cluster.
 #
 # Before applying:
-#   1. On the horus host:  horus cluster add <cluster-id> --zone <zone>
-#      and copy the printed token.
+#   1. On the horus host:  horus cluster add <cluster-id> --zone <zone> [--zone <zone>...]
+#      and copy the printed token. More zones can be added later with
+#      `horus cluster zone add <cluster-id> <zone>` (no operator restart).
 #   2. kubectl create namespace horus-system
 #      kubectl -n horus-system create secret generic horus-operator-token --from-literal=token=<token>
 #      (and, if horus uses a private CA: --from-file=ca.crt=<ca.pem>; then

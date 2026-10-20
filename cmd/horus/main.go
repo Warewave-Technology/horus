@@ -30,7 +30,10 @@ Usage:
       OWNER: manual, <cluster>, <cluster>/<namespace> or <cluster>/<namespace>/<ingress>
 
   horus [global flags] cluster ls
-  horus [global flags] cluster add <id> --zone <zone>     prints the cluster token once
+  horus [global flags] cluster add <id> --zone <zone> [--zone <zone>...]
+                                                          prints the cluster token once
+  horus [global flags] cluster zone add <id> <zone>       let the cluster write to one more zone
+  horus [global flags] cluster zone rm <id> <zone>        also removes the cluster's records in it
   horus [global flags] cluster rotate <id>                prints the new token once
   horus [global flags] cluster rm <id>                    also removes the cluster's records
 

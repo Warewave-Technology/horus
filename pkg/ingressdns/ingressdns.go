@@ -62,10 +62,11 @@ func Enabled(ann map[string]string) bool {
 	return strings.EqualFold(strings.TrimSpace(ann[AnnotationRegister]), "true")
 }
 
-// Desired computes the plan for an Ingress in the given zone (normalized FQDN).
-// It returns an error only for malformed annotations, which the operator
-// reports as an event; nothing is changed on the server in that case.
-func Desired(in Input, zone string) (Plan, error) {
+// Desired computes the plan for an Ingress of a cluster that may write to
+// zones (normalized FQDNs). Hosts outside every zone are skipped. It returns
+// an error only for malformed annotations, which the operator reports as an
+// event; nothing is changed on the server in that case.
+func Desired(in Input, zones []string) (Plan, error) {
 	var p Plan
 
 	var ttl uint32
@@ -92,6 +93,7 @@ func Desired(in Input, zone string) (Plan, error) {
 
 	seen := map[string]bool{}
 	var names []string
+	zoneOf := map[string]string{}
 	for _, h := range hosts {
 		h = strings.TrimSpace(h)
 		if h == "" {
@@ -102,15 +104,17 @@ func Desired(in Input, zone string) (Plan, error) {
 			continue
 		}
 		seen[name] = true
+		zone := api.ZoneFor(name, zones)
 		switch {
 		case strings.HasPrefix(name, "*."):
 			p.Skipped = append(p.Skipped, Skip{Host: h, Reason: "wildcard hosts are not supported"})
-		case !api.InZone(name, zone):
-			p.Skipped = append(p.Skipped, Skip{Host: h, Reason: "outside zone " + zone})
+		case zone == "":
+			p.Skipped = append(p.Skipped, Skip{Host: h, Reason: outsideReason(zones)})
 		case name == zone && len(targets) == 1 && targets[0].Type == api.TypeCNAME:
 			p.Skipped = append(p.Skipped, Skip{Host: h, Reason: "CNAME is not allowed at the zone apex"})
 		default:
 			names = append(names, name)
+			zoneOf[name] = zone
 		}
 	}
 	sort.Strings(names)
@@ -126,11 +130,21 @@ func Desired(in Input, zone string) (Plan, error) {
 	}
 	// Final safety net: the server would reject these anyway.
 	for i := range p.Records {
-		if err := api.ValidateRecord(&p.Records[i], zone); err != nil {
+		if err := api.ValidateRecord(&p.Records[i], zoneOf[p.Records[i].Name]); err != nil {
 			return Plan{}, err
 		}
 	}
 	return p, nil
+}
+
+func outsideReason(zones []string) string {
+	switch len(zones) {
+	case 0:
+		return "the cluster has no zones"
+	case 1:
+		return "outside zone " + zones[0]
+	}
+	return "outside the cluster's zones " + strings.Join(zones, ", ")
 }
 
 type target struct {

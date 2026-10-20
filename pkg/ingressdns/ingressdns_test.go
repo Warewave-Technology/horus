@@ -1,12 +1,13 @@
 package ingressdns
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
-const zone = "prod.internal.example."
+var zones = []string{"prod.internal.example."}
 
 func on(extra map[string]string) map[string]string {
 	m := map[string]string{AnnotationRegister: "true"}
@@ -35,7 +36,7 @@ func TestDesiredFromLBIPs(t *testing.T) {
 		Annotations:  on(map[string]string{AnnotationTTL: "60"}),
 		Hosts:        []string{"web.prod.internal.example", "API.prod.internal.example", "web.prod.internal.example", ""},
 		LoadBalancer: []LBEntry{{IP: "10.0.0.2"}, {IP: "2001:db8::1"}, {IP: "10.0.0.2"}},
-	}, zone)
+	}, zones)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,7 @@ func TestDesiredFromLBHostname(t *testing.T) {
 		Annotations:  on(nil),
 		Hosts:        []string{"web.prod.internal.example", "prod.internal.example"},
 		LoadBalancer: []LBEntry{{Hostname: "abc.elb.amazonaws.com"}},
-	}, zone)
+	}, zones)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +81,7 @@ func TestDesiredSkipsAndPending(t *testing.T) {
 	p, err := Desired(Input{
 		Annotations: on(nil),
 		Hosts:       []string{"*.prod.internal.example", "web.staging.internal.example", "web.prod.internal.example"},
-	}, zone)
+	}, zones)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +90,7 @@ func TestDesiredSkipsAndPending(t *testing.T) {
 	}
 
 	// Nothing in zone: not pending, just empty (operator will clear records).
-	p, err = Desired(Input{Annotations: on(nil), Hosts: []string{"x.other.example"}}, zone)
+	p, err = Desired(Input{Annotations: on(nil), Hosts: []string{"x.other.example"}}, zones)
 	if err != nil || p.Pending || len(p.Records) != 0 {
 		t.Fatalf("%+v %v", p, err)
 	}
@@ -103,7 +104,7 @@ func TestDesiredAnnotationOverrides(t *testing.T) {
 		}),
 		Hosts:        []string{"ignored.prod.internal.example"},
 		LoadBalancer: []LBEntry{{IP: "10.0.0.1"}},
-	}, zone)
+	}, zones)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +126,7 @@ func TestDesiredBadAnnotations(t *testing.T) {
 	} {
 		in := base
 		in.Annotations = on(ann)
-		if _, err := Desired(in, zone); err == nil {
+		if _, err := Desired(in, zones); err == nil {
 			t.Errorf("%s: expected error", name)
 		}
 	}
@@ -136,8 +137,54 @@ func TestIPsWinOverHostnames(t *testing.T) {
 		Annotations:  on(nil),
 		Hosts:        []string{"a.prod.internal.example"},
 		LoadBalancer: []LBEntry{{Hostname: "lb.example.com"}, {IP: "10.0.0.1"}},
-	}, zone)
+	}, zones)
 	if err != nil || len(p.Records) != 1 || p.Records[0].Type != api.TypeA {
 		t.Fatalf("%+v %v", p, err)
+	}
+}
+
+func TestDesiredSeveralZones(t *testing.T) {
+	multi := []string{"edge.example.", "prod.internal.example."}
+	p, err := Desired(Input{
+		Annotations:  on(nil),
+		Hosts:        []string{"web.prod.internal.example", "web.edge.example", "edge.example", "x.other.example"},
+		LoadBalancer: []LBEntry{{IP: "10.0.0.1"}},
+	}, multi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Records carry no zone: the server puts each into the cluster zone that
+	// contains it.
+	var got []string
+	for _, r := range p.Records {
+		got = append(got, r.Key())
+	}
+	want := []string{
+		"edge.example. A 10.0.0.1",
+		"web.edge.example. A 10.0.0.1",
+		"web.prod.internal.example. A 10.0.0.1",
+	}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("records:\n got %q\nwant %q", got, want)
+	}
+	if len(p.Skipped) != 1 || p.Skipped[0].Host != "x.other.example" ||
+		p.Skipped[0].Reason != "outside the cluster's zones edge.example., prod.internal.example." {
+		t.Fatalf("skipped: %+v", p.Skipped)
+	}
+
+	// The apex rule applies per zone.
+	p, err = Desired(Input{
+		Annotations:  on(nil),
+		Hosts:        []string{"edge.example", "web.edge.example"},
+		LoadBalancer: []LBEntry{{Hostname: "lb.example.com"}},
+	}, multi)
+	if err != nil || len(p.Records) != 1 || p.Records[0].Name != "web.edge.example." || len(p.Skipped) != 1 {
+		t.Fatalf("apex: %+v %v", p, err)
+	}
+
+	// No zones at all: everything is skipped.
+	p, err = Desired(Input{Annotations: on(nil), Hosts: []string{"a.example"}, LoadBalancer: []LBEntry{{IP: "10.0.0.1"}}}, nil)
+	if err != nil || len(p.Records) != 0 || p.Skipped[0].Reason != "the cluster has no zones" {
+		t.Fatalf("no zones: %+v %v", p, err)
 	}
 }

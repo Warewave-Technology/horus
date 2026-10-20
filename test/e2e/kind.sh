@@ -22,6 +22,7 @@ CLUSTER=${CLUSTER:-horus-e2e}
 DNS_PORT=${DNS_PORT:-15300}
 API_PORT=${API_PORT:-18300}
 ZONE=e2e.horus.test
+ZONE2=edge.horus.test
 IMAGE=horus-operator:e2e
 TIMEOUT=${TIMEOUT:-90}
 
@@ -124,6 +125,7 @@ wait_for "horus API" curl -sf --cacert "$WORK/creds/api-tls-cert" "https://127.0
 
 cli() { HORUS_ADDR=unix://$WORK/api.sock HORUS_TOKEN_FILE=$WORK/creds/admin-token "$HORUS" "$@"; }
 cli zone add "$ZONE" --ttl 60
+cli zone add "$ZONE2" --ttl 60
 cli record add "taken.$ZONE" A 10.99.9.9
 TOKEN=$(cli --json cluster add kind --zone "$ZONE" | sed -n 's/.*"token": "\(.*\)".*/\1/p')
 [[ -n $TOKEN ]] || fail "no cluster token"
@@ -136,7 +138,7 @@ kubectl -n horus-system create secret generic horus-operator-token \
 IMAGE=$IMAGE URL=https://$HORUS_E2E_HOST:$API_PORT perl -pe '
 	s#^(\s+image: )\S+#$1$ENV{IMAGE}#;
 	s#https://horus.internal.example:8053#$ENV{URL}#;
-	s#^(\s+)- --leader-elect$#$1- --leader-elect\n$1- --ca-file=/var/run/secrets/horus/ca.crt\n$1- --gc-interval=5s#;
+	s#^(\s+)- --leader-elect$#$1- --leader-elect\n$1- --ca-file=/var/run/secrets/horus/ca.crt\n$1- --gc-interval=5s\n$1- --zone-refresh=5s#;
 ' "$ROOT/operator/config/operator.yaml" | kubectl apply -f -
 kubectl -n horus-system rollout status deploy/horus-operator --timeout=120s || fail "operator did not become ready"
 
@@ -212,7 +214,24 @@ answer_is "web.$ZONE" A 10.99.0.11 || fail "web.$ZONE should still resolve while
 kubectl -n horus-system scale deploy/horus-operator --replicas=1 >/dev/null
 wait_for "web.$ZONE gone after restart" nxdomain "web.$ZONE"
 
-log "8. forwarding still works next to the authoritative zone"
+log "8. a second zone added to the cluster at runtime is picked up without a restart"
+ingress multi "a.$ZONE" '    horus.warewave.tech/hostnames: "a.'"$ZONE"',a.'"$ZONE2"'"'
+lb_ip multi 10.99.0.30
+wait_for "a.$ZONE A 10.99.0.30" answer_is "a.$ZONE" A 10.99.0.30
+wait_for "HostSkipped event for a.$ZONE2" has_event HostSkipped
+nxdomain "a.$ZONE2" || fail "a.$ZONE2 must not resolve before $ZONE2 is assigned"
+cli cluster zone add kind "$ZONE2"
+wait_for "a.$ZONE2 A 10.99.0.30" answer_is "a.$ZONE2" A 10.99.0.30
+cli --json whoami >/dev/null
+
+log "9. removing that zone deletes the cluster's records in it, the rest stays"
+cli cluster zone rm kind "$ZONE2"
+wait_for "a.$ZONE2 gone" nxdomain "a.$ZONE2"
+answer_is "a.$ZONE" A 10.99.0.30 || fail "a.$ZONE must survive the removal of $ZONE2"
+sleep 7 # one zone refresh: the operator must not re-add the name
+nxdomain "a.$ZONE2" || fail "a.$ZONE2 came back after the zone was removed"
+
+log "10. forwarding still works next to the authoritative zones"
 cli owners
 dig @127.0.0.1 -p "$DNS_PORT" +tries=1 +time=3 example.com A | grep -q 'status: NOERROR' ||
 	echo "warning: forwarding check failed (no internet access?)"

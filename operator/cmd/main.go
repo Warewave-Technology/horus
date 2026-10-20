@@ -1,8 +1,9 @@
 // Command horus-operator registers annotated Ingresses in a horus DNS server.
 //
 // Each cluster runs one operator (leader-elected) with its own cluster token.
-// The token decides the cluster id (owner prefix) and the single zone the
-// cluster may write to; the operator learns both from GET /v1/whoami.
+// The token decides the cluster id (owner prefix) and the zones the cluster
+// may write to; the operator learns both from GET /v1/whoami and re-reads the
+// zones every --zone-refresh.
 package main
 
 import (
@@ -19,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -47,6 +49,7 @@ func run() error {
 		leaderElect  bool
 		gcInterval   time.Duration
 		pendingRetry time.Duration
+		zoneRefresh  time.Duration
 	)
 	flag.StringVar(&horusURL, "horus-url", os.Getenv("HORUS_URL"), "horus API base URL, e.g. https://horus.internal:8053")
 	flag.StringVar(&tokenFile, "token-file", "/var/run/secrets/horus/token", "file holding the cluster token")
@@ -56,6 +59,7 @@ func run() error {
 	flag.BoolVar(&leaderElect, "leader-elect", true, "enable leader election (needed with >1 replica)")
 	flag.DurationVar(&gcInterval, "gc-interval", 5*time.Minute, "how often to remove records of vanished Ingresses")
 	flag.DurationVar(&pendingRetry, "pending-requeue", 30*time.Second, "re-check interval for Ingresses without an LB address")
+	flag.DurationVar(&zoneRefresh, "zone-refresh", time.Minute, "how often to re-read the cluster's zones from horus")
 	zopts := zap.Options{}
 	zopts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -98,7 +102,11 @@ func run() error {
 	if who.Admin || who.Cluster == "" {
 		return fmt.Errorf("the token is an admin token; the operator needs a cluster token (horus cluster add)")
 	}
-	setupLog.Info("connected to horus", "version", version, "cluster", who.Cluster, "zone", who.Zone)
+	zones := controller.NewZones(controller.ZonesOf(who))
+	if len(zones.Get()) == 0 {
+		return fmt.Errorf("cluster %q has no zones (horus cluster zone add)", who.Cluster)
+	}
+	setupLog.Info("connected to horus", "version", version, "cluster", who.Cluster, "zones", zones.Get())
 
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -124,10 +132,23 @@ func run() error {
 		return err
 	}
 
+	zoneEvents := make(chan event.GenericEvent)
+	watcher := &controller.ZoneWatcher{
+		Horus:    hc,
+		Zones:    zones,
+		Reader:   mgr.GetClient(),
+		Events:   zoneEvents,
+		Interval: zoneRefresh,
+	}
+	if err := mgr.Add(watcher); err != nil {
+		return err
+	}
 	if err := (&controller.IngressReconciler{
 		Client:         mgr.GetClient(),
 		Horus:          hc,
-		Zone:           who.Zone,
+		Zones:          zones,
+		RefreshZones:   watcher.Refresh,
+		Events:         zoneEvents,
 		Recorder:       mgr.GetEventRecorderFor("horus-operator"),
 		PendingRequeue: pendingRetry,
 	}).SetupWithManager(mgr); err != nil {

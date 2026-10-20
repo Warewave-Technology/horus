@@ -17,8 +17,8 @@ records. Simplicity beats throughput everywhere below.
 | HA | No. Single node, `Restart=on-failure`, daily SQLite backups. |
 | Upstream | Plain forwarder (not a recursive resolver), ordered failover, cache. |
 | Kubernetes | Operator watches Ingresses with `horus.warewave.tech/register: "true"`. Ingress controllers sit behind a LoadBalancer, so the target comes from `status.loadBalancer`. |
-| Multi-cluster | Yes. Each cluster has its own token, bound to exactly one zone. |
-| Zones | Each cluster has its own zone. Manual (CLI) records may also live in a cluster's zone. |
+| Multi-cluster | Yes. Each cluster has its own token, bound to one or more zones. |
+| Zones | A cluster may own several zones; a zone belongs to at most one cluster. Zones can be added to or removed from a cluster at runtime. Manual (CLI) records may also live in a cluster's zones. |
 | Name conflicts | First-wins. A name belongs to exactly one owner. Conflicting names are skipped and reported; the rest of the Ingress is still applied. |
 | Admin auth | One admin token. Only the owner has shell access to the host. |
 | Config | `HORUS_*` environment variables (systemd `EnvironmentFile=`), no config file format. |
@@ -90,12 +90,16 @@ not optimize it until it shows up in a profile.
 
 ## Data model
 
-See `internal/store/schema.sql`.
+See `internal/store/schema.sql` (version 1) and `internal/store/migrate_v2.sql`.
+`store.Open` applies the migrations in order and tracks the version in
+`PRAGMA user_version`; applied migrations are never edited.
 
 - `zones`: name (lowercase FQDN with trailing dot), default TTL, serial.
   Overlapping zones (one inside another) are rejected so that every name maps
   to exactly one zone.
-- `clusters`: id, the one zone it may write to, `sha256(token)`, last_seen.
+- `clusters`: id, `sha256(token)`, created_at, last_seen.
+- `cluster_zones`: (cluster, zone) pairs; `UNIQUE(zone)`, so a zone belongs to
+  at most one cluster. A cluster always keeps at least one zone.
 - `records`: zone, name, type, data, ttl (0 = zone default), **owner**.
   `UNIQUE(name, type, data)`.
 - `audit_log`: who (`admin` / `cluster:<id>`), what, when, JSON detail.
@@ -114,10 +118,13 @@ Rules, enforced inside the write transaction (single writer, so no races):
 2. **CNAME exclusivity:** a name with a CNAME has no other records; at most one
    CNAME per name; no CNAME at a zone apex.
 3. Manual records can only be deleted by id through the admin API; operator
-   records only disappear through their owner (PUT/DELETE) or when the
-   cluster is deleted.
-4. A cluster token can only write records in its own zone, under its own
+   records only disappear through their owner (PUT/DELETE), when the cluster
+   is deleted, or when the zone they are in is taken away from the cluster.
+4. A cluster token can only write records in its own zones, under its own
    owner prefix; the prefix comes from the token, never from the request.
+   One owner (one Ingress) may hold names in several of the cluster's zones;
+   each record goes to the cluster zone that contains its name, and a name
+   outside all of them makes the whole PUT a 422.
 
 ### Owner PUT semantics
 
@@ -132,8 +139,13 @@ twice is a no-op. This keeps the operator stateless.
 Separate Go module (`operator/`) so the server binary stays free of
 client-go. Shares `pkg/api`, `pkg/client`, `pkg/ingressdns`.
 
-- Startup: read the cluster token, `GET /v1/whoami` → cluster id + zone.
-  An admin token is refused.
+- Startup: read the cluster token, `GET /v1/whoami` → cluster id + zones.
+  An admin token, or a cluster without zones, is refused.
+- Zones: re-read every `--zone-refresh` (1m), and immediately when horus
+  answers a PUT with 422. When they change, every opted-in Ingress is queued
+  again, so `horus cluster zone add|rm` needs no operator restart.
+  `whoami` still returns `zone` (the first zone) for operators older than
+  v0.2.0; a new operator falls back to it against an older server.
 - Watch: Ingresses, filtered by a predicate that passes only Ingresses that
   are (or just stopped being) annotated, so unannotated Ingresses cause no
   API traffic.
@@ -143,7 +155,7 @@ client-go. Shares `pkg/api`, `pkg/client`, `pkg/ingressdns`.
     hosts from `spec.rules[].host` (or `horus.warewave.tech/hostnames`),
     targets from `status.loadBalancer.ingress` (or `horus.warewave.tech/target`):
     IPs → A/AAAA (IPs win over hostnames), a hostname → CNAME.
-    Wildcards, hosts outside the cluster zone and apex CNAMEs are skipped
+    Wildcards, hosts outside the cluster's zones and apex CNAMEs are skipped
     with a Warning event.
   - No LB address yet → leave existing records alone, requeue in 30s.
   - `PUT owner` → events for conflicts (`HostnameConflict`) and changes
@@ -196,6 +208,8 @@ horus zone add prod.internal.example
 horus zone add staging.internal.example
 horus record add db.prod.internal.example A 10.0.0.5
 horus cluster add prod --zone prod.internal.example        # prints token once
+horus zone add edge.internal.example
+horus cluster zone add prod edge.internal.example          # prod may now write there too
 kubectl create namespace horus-system
 kubectl -n horus-system create secret generic horus-operator-token --from-literal=token=hrs_...
 kubectl apply -f operator/config/operator.yaml   # after setting image + HORUS_URL

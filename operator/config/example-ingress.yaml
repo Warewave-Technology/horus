@@ -1,5 +1,6 @@
 # An Ingress that horus-operator registers.
-# Result (cluster zone prod.internal.example.):
+# Result (the cluster owns zone prod.internal.example.; hosts in any other zone
+# of the cluster work the same way, hosts outside its zones are skipped):
 #   web.prod.internal.example.  A  <status.loadBalancer.ingress[].ip>  TTL 60
 apiVersion: networking.k8s.io/v1
 kind: Ingress

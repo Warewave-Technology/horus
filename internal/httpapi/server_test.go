@@ -3,8 +3,10 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -121,14 +123,20 @@ func (f *fakeStore) DeleteRecord(_ context.Context, _ string, id int64) error {
 	return store.ErrNotFound
 }
 
-func (f *fakeStore) ReplaceOwner(_ context.Context, _, zone, owner string, recs []api.Record) (api.OwnerRecordsResponse, error) {
+func (f *fakeStore) ReplaceOwner(_ context.Context, _, cluster, owner string, recs []api.Record) (api.OwnerRecordsResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var resp api.OwnerRecordsResponse
+	zones := f.clusters[cluster].Zones
 	for i := range recs {
+		zone := api.ZoneFor(api.NormalizeName(recs[i].Name), zones)
+		if zone == "" {
+			return resp, fmt.Errorf("%w: outside the cluster's zones", api.ErrInvalid)
+		}
 		if err := api.ValidateRecord(&recs[i], zone); err != nil {
 			return resp, err
 		}
+		recs[i].Zone = zone
 	}
 	kept := f.records[:0]
 	for _, r := range f.records {
@@ -145,7 +153,7 @@ func (f *fakeStore) ReplaceOwner(_ context.Context, _, zone, owner string, recs 
 			continue
 		}
 		f.nextID++
-		r.ID, r.Zone, r.Owner = f.nextID, zone, owner
+		r.ID, r.Owner = f.nextID, owner
 		f.records = append(f.records, r)
 		resp.Added++
 	}
@@ -193,20 +201,70 @@ func (f *fakeStore) ListClusters(context.Context) ([]api.Cluster, error) {
 	return out, nil
 }
 
-func (f *fakeStore) CreateCluster(_ context.Context, _, id, zone string, h []byte) (api.Cluster, error) {
+func (f *fakeStore) CreateCluster(_ context.Context, _, id string, zones []string, h []byte) (api.Cluster, error) {
 	if err := api.ValidateClusterID(id); err != nil {
 		return api.Cluster{}, err
 	}
+	if len(zones) == 0 {
+		return api.Cluster{}, api.ErrInvalid
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	zone = api.NormalizeName(zone)
-	if _, ok := f.zones[zone]; !ok {
-		return api.Cluster{}, store.ErrNotFound
+	c := api.Cluster{ID: id}
+	for _, z := range zones {
+		z = api.NormalizeName(z)
+		if _, ok := f.zones[z]; !ok {
+			return api.Cluster{}, store.ErrNotFound
+		}
+		c.Zones = append(c.Zones, z)
 	}
-	c := api.Cluster{ID: id, Zone: zone}
+	sort.Strings(c.Zones)
 	f.clusters[id] = c
 	f.tokens[string(h)] = id
 	return c, nil
+}
+
+func (f *fakeStore) AddClusterZone(_ context.Context, _, id, zone string) (api.Cluster, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.clusters[id]
+	zone = api.NormalizeName(zone)
+	if _, zok := f.zones[zone]; !ok || !zok {
+		return c, store.ErrNotFound
+	}
+	if slices.Contains(c.Zones, zone) {
+		return c, store.ErrExists
+	}
+	c.Zones = append(slices.Clone(c.Zones), zone)
+	sort.Strings(c.Zones)
+	f.clusters[id] = c
+	return c, nil
+}
+
+func (f *fakeStore) RemoveClusterZone(_ context.Context, _, id, zone string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.clusters[id]
+	zone = api.NormalizeName(zone)
+	if !ok || !slices.Contains(c.Zones, zone) {
+		return 0, store.ErrNotFound
+	}
+	if len(c.Zones) == 1 {
+		return 0, api.ErrInvalid
+	}
+	n := 0
+	kept := f.records[:0]
+	for _, r := range f.records {
+		if r.Zone == zone && strings.HasPrefix(r.Owner, id+"/") {
+			n++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	f.records = kept
+	c.Zones = slices.DeleteFunc(slices.Clone(c.Zones), func(z string) bool { return z == zone })
+	f.clusters[id] = c
+	return n, nil
 }
 
 func (f *fakeStore) RotateClusterToken(_ context.Context, _, id string, h []byte) error {
@@ -322,14 +380,15 @@ func TestClusterFlow(t *testing.T) {
 	if _, err := admin.AddRecord(ctx, "prod.internal.example.", api.Record{Name: "taken.prod.internal.example.", Type: api.TypeA, Data: "10.0.0.9"}); err != nil {
 		t.Fatal(err)
 	}
-	cl, err := admin.CreateCluster(ctx, "prod", "prod.internal.example")
+	cl, err := admin.CreateCluster(ctx, "prod", []string{"prod.internal.example"})
 	if err != nil || !strings.HasPrefix(cl.Token, "hrs_") {
 		t.Fatalf("create cluster: %+v %v", cl, err)
 	}
 	op, _ := client.New(ts.URL, cl.Token, client.Options{})
 
 	w, err := op.WhoAmI(ctx)
-	if err != nil || w.Admin || w.Cluster != "prod" || w.Zone != "prod.internal.example." {
+	if err != nil || w.Admin || w.Cluster != "prod" || w.Zone != "prod.internal.example." ||
+		len(w.Zones) != 1 || w.Zones[0] != "prod.internal.example." {
 		t.Fatalf("whoami: %+v %v", w, err)
 	}
 	// Cluster tokens cannot use admin endpoints.
@@ -368,6 +427,46 @@ func TestClusterFlow(t *testing.T) {
 	}
 	if owners, _ := op.ListOwners(ctx); len(owners) != 0 {
 		t.Fatalf("owners after delete: %v", owners)
+	}
+
+	// A second zone: the same owner may then hold names in both zones.
+	if _, err := admin.CreateZone(ctx, "edge.internal.example", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.ReplaceOwner(ctx, "default", "web", []api.Record{
+		{Name: "web.edge.internal.example.", Type: api.TypeA, Data: "10.0.1.1"},
+	}); !client.IsStatus(err, http.StatusUnprocessableEntity) {
+		t.Fatalf("zone not yet assigned: %v", err)
+	}
+	if _, err := op.AddClusterZone(ctx, "prod", "edge.internal.example"); !client.IsStatus(err, http.StatusForbidden) {
+		t.Fatalf("cluster token adding zones: %v", err)
+	}
+	c2, err := admin.AddClusterZone(ctx, "prod", "edge.internal.example")
+	if err != nil || strings.Join(c2.Zones, ",") != "edge.internal.example.,prod.internal.example." {
+		t.Fatalf("add zone: %+v %v", c2, err)
+	}
+	if w, _ := op.WhoAmI(ctx); len(w.Zones) != 2 || w.Zone != "edge.internal.example." {
+		t.Fatalf("whoami after add: %+v", w)
+	}
+	resp, err = op.ReplaceOwner(ctx, "default", "web", []api.Record{
+		{Name: "web.prod.internal.example.", Type: api.TypeA, Data: "10.0.1.1"},
+		{Name: "web.edge.internal.example.", Type: api.TypeA, Data: "10.0.1.1", Zone: "edge.internal.example"},
+	})
+	if err != nil || resp.Added != 2 {
+		t.Fatalf("replace across zones: %+v %v", resp, err)
+	}
+	if _, err := admin.AddClusterZone(ctx, "prod", "edge.internal.example"); !client.IsStatus(err, http.StatusConflict) {
+		t.Fatalf("adding a zone twice: %v", err)
+	}
+	n, err := admin.RemoveClusterZone(ctx, "prod", "edge.internal.example.")
+	if err != nil || n != 1 {
+		t.Fatalf("remove zone: %d %v", n, err)
+	}
+	if _, err := admin.RemoveClusterZone(ctx, "prod", "prod.internal.example"); !client.IsStatus(err, http.StatusUnprocessableEntity) {
+		t.Fatalf("removing the last zone: %v", err)
+	}
+	if _, err := admin.RemoveClusterZone(ctx, "prod", "edge.internal.example"); !client.IsStatus(err, http.StatusNotFound) {
+		t.Fatalf("removing a zone the cluster does not have: %v", err)
 	}
 
 	// Rotation invalidates the old token.

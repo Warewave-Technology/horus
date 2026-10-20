@@ -158,9 +158,23 @@ func (c *Client) ListClusters(ctx context.Context) ([]api.Cluster, error) {
 }
 
 // CreateCluster returns the cluster including its token (shown only once).
-func (c *Client) CreateCluster(ctx context.Context, id, zone string) (api.Cluster, error) {
+func (c *Client) CreateCluster(ctx context.Context, id string, zones []string) (api.Cluster, error) {
 	var out api.Cluster
-	return out, c.do(ctx, http.MethodPost, "/v1/clusters", api.CreateClusterRequest{ID: id, Zone: zone}, &out)
+	return out, c.do(ctx, http.MethodPost, "/v1/clusters", api.CreateClusterRequest{ID: id, Zones: zones}, &out)
+}
+
+// AddClusterZone gives the cluster one more zone and returns the cluster.
+func (c *Client) AddClusterZone(ctx context.Context, id, zone string) (api.Cluster, error) {
+	var out api.Cluster
+	return out, c.do(ctx, http.MethodPost, "/v1/clusters/"+esc(id)+"/zones", api.ClusterZoneRequest{Zone: zone}, &out)
+}
+
+// RemoveClusterZone takes a zone away from the cluster, deleting the cluster's
+// records in it. It returns how many records were deleted.
+func (c *Client) RemoveClusterZone(ctx context.Context, id, zone string) (int, error) {
+	var out api.RemoveClusterZoneResponse
+	err := c.do(ctx, http.MethodDelete, "/v1/clusters/"+esc(id)+"/zones/"+esc(zone), nil, &out)
+	return out.RecordsRemoved, err
 }
 
 // RotateClusterToken returns the new token.

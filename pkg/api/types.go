@@ -66,12 +66,13 @@ type Record struct {
 // Key identifies a record independently of its id/ttl/owner.
 func (r Record) Key() string { return r.Name + " " + string(r.Type) + " " + r.Data }
 
-// Cluster is a Kubernetes cluster allowed to manage records in exactly one zone.
+// Cluster is a Kubernetes cluster allowed to manage records in its zones.
+// A cluster has one or more zones; a zone belongs to at most one cluster.
 type Cluster struct {
-	ID        string `json:"id"`
-	Zone      string `json:"zone"`
-	CreatedAt int64  `json:"created_at,omitempty"`
-	LastSeen  int64  `json:"last_seen,omitempty"`
+	ID        string   `json:"id"`
+	Zones     []string `json:"zones,omitempty"` // sorted
+	CreatedAt int64    `json:"created_at,omitempty"`
+	LastSeen  int64    `json:"last_seen,omitempty"`
 	// Token is only ever returned once: on create and on rotate.
 	Token string `json:"token,omitempty"`
 }
@@ -84,8 +85,19 @@ type CreateZoneRequest struct {
 
 // CreateClusterRequest is the body of POST /v1/clusters.
 type CreateClusterRequest struct {
-	ID   string `json:"id"`
+	ID    string   `json:"id"`
+	Zones []string `json:"zones"`
+}
+
+// ClusterZoneRequest is the body of POST /v1/clusters/{id}/zones.
+type ClusterZoneRequest struct {
 	Zone string `json:"zone"`
+}
+
+// RemoveClusterZoneResponse is the body of DELETE /v1/clusters/{id}/zones/{zone}.
+type RemoveClusterZoneResponse struct {
+	// RecordsRemoved counts the cluster's records deleted from that zone.
+	RecordsRemoved int `json:"records_removed"`
 }
 
 // OwnerRecordsRequest is the body of PUT /v1/owners/{namespace}/{name}/records.
@@ -122,9 +134,12 @@ type OwnersResponse struct {
 
 // WhoAmI is the body of GET /v1/whoami.
 type WhoAmI struct {
-	Admin   bool   `json:"admin"`
-	Cluster string `json:"cluster,omitempty"`
-	Zone    string `json:"zone,omitempty"`
+	Admin   bool     `json:"admin"`
+	Cluster string   `json:"cluster,omitempty"`
+	Zones   []string `json:"zones,omitempty"` // sorted
+	// Zone is Zones[0]. Deprecated: kept for operators older than v0.2.0,
+	// which understand a single zone only.
+	Zone string `json:"zone,omitempty"`
 }
 
 // Error is the body of every non-2xx response.

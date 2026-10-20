@@ -8,7 +8,7 @@ Two kinds of token:
 
 - **admin** — from `/etc/horus/admin.token`; used by the CLI.
 - **cluster** — `hrs_...`, created by `POST /v1/clusters`, stored as sha256.
-  Bound to one cluster id and one zone.
+  Bound to one cluster id and that cluster's zones (one or more).
 
 Errors: `{"error": "...", "conflicts": [{"name": "...", "held_by": "..."}]}`
 
@@ -34,8 +34,12 @@ Every successful write is live in DNS when the response is sent.
 
 ### `GET /v1/whoami`
 ```json
-{"admin": false, "cluster": "prod", "zone": "prod.internal.example."}
+{"admin": false, "cluster": "prod",
+ "zones": ["edge.internal.example.", "prod.internal.example."],
+ "zone": "edge.internal.example."}
 ```
+`zones` is sorted. `zone` is `zones[0]`, kept for operators older than v0.2.0
+(deprecated). For the admin token: `{"admin": true}`.
 
 ## Admin token
 
@@ -63,11 +67,23 @@ Every successful write is live in DNS when the response is sent.
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/v1/clusters` | | `[Cluster]` (no tokens) |
-| POST | `/v1/clusters` | `{"id": "prod", "zone": "prod.internal.example"}` | 201 `Cluster` **with `token` (only time it is shown)** |
+| POST | `/v1/clusters` | `{"id": "prod", "zones": ["prod.internal.example", "edge.internal.example"]}` | 201 `Cluster` **with `token` (only time it is shown)** |
+| POST | `/v1/clusters/{id}/zones` | `{"zone": "edge.internal.example"}` | 200 `Cluster` (no token) |
+| DELETE | `/v1/clusters/{id}/zones/{zone}` | | 200 `{"records_removed": 3}`; deletes the cluster's records in that zone |
 | POST | `/v1/clusters/{id}/rotate-token` | | `{"id", "token"}`; old token stops working immediately |
 | DELETE | `/v1/clusters/{id}` | | 204; also deletes every record owned by the cluster |
 
-`id`: `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`. One cluster per zone.
+`Cluster`: `{"id", "zones": [sorted zone names], "created_at", "last_seen", "token"}`.
+`id`: `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`.
+
+- A cluster has at least one zone; a zone belongs to at most one cluster.
+- Create: `zones` must be non-empty; every zone must exist (404) and be free
+  (409, nothing is created).
+- Add zone: 404 for an unknown cluster or zone, 409 if the zone already
+  belongs to this or another cluster.
+- Remove zone: 404 if the cluster does not have it, 422 for the cluster's last
+  zone (delete the cluster instead). Manual records in the zone stay.
+- A zone that belongs to a cluster cannot be deleted (409).
 
 ### Backup
 | Method | Path | Response |
@@ -86,7 +102,10 @@ Owner = `<cluster>/<namespace>/<name>`; the cluster part comes from the token.
 
 ### `PUT /v1/owners/{namespace}/{name}/records`
 The complete desired set for this owner. Records not listed are removed.
-Records must not set `id`, `owner`, or a `zone` other than the cluster's.
+Records must not set `id`, `owner`, or a `zone` that is not one of the
+cluster's. Each record is stored in the cluster zone that contains its name, so
+one owner may span several zones. A name outside all of the cluster's zones
+makes the whole request a 422 (nothing is applied).
 ```json
 {"records": [
   {"name": "web.prod.internal.example.", "type": "A", "data": "10.20.0.15", "ttl": 60},

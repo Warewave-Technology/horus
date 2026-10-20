@@ -85,3 +85,23 @@ func TestInZone(t *testing.T) {
 		t.Fatal("suffix without dot must not match")
 	}
 }
+
+func TestZoneFor(t *testing.T) {
+	zones := []string{"a.example.", "b.example.", "x.a.example."}
+	for name, want := range map[string]string{
+		"a.example.":        "a.example.",
+		"w.a.example.":      "a.example.",
+		"w.x.a.example.":    "x.a.example.",
+		"b.example.":        "b.example.",
+		"c.example.":        "",
+		"aa.example.":       "",
+		"w.b.example.extra": "",
+	} {
+		if got := ZoneFor(name, zones); got != want {
+			t.Errorf("ZoneFor(%q) = %q, want %q", name, got, want)
+		}
+	}
+	if ZoneFor("a.example.", nil) != "" {
+		t.Error("no zones")
+	}
+}

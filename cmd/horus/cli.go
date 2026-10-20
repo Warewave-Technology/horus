@@ -97,7 +97,7 @@ func runCLI(args []string) error {
 			if w.Admin {
 				fmt.Fprintln(out, "admin")
 			} else {
-				fmt.Fprintf(out, "cluster %s (zone %s)\n", w.Cluster, w.Zone)
+				fmt.Fprintf(out, "cluster %s (zones %s)\n", w.Cluster, strings.Join(w.Zones, ", "))
 			}
 		})
 	}
@@ -318,6 +318,20 @@ func conflictHint(err error) error {
 	return err
 }
 
+// listFlag is a repeatable flag that also splits comma-separated values.
+type listFlag []string
+
+func (l *listFlag) String() string { return strings.Join(*l, ",") }
+
+func (l *listFlag) Set(v string) error {
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			*l = append(*l, item)
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------- owners
 
 // ownerSummary is one row of `horus owners`.
@@ -399,8 +413,12 @@ func (x *cli) cluster(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		args = []string{"ls"}
 	}
+	if args[0] == "zone" || args[0] == "zones" {
+		return x.clusterZone(ctx, args[1:])
+	}
 	fs := flag.NewFlagSet("cluster", flag.ContinueOnError)
-	zone := fs.String("zone", "", "zone the cluster may write to")
+	var zones listFlag
+	fs.Var(&zones, "zone", "zone the cluster may write to (repeatable, or comma-separated)")
 	pos, err := parse(fs, args[1:])
 	if err != nil {
 		return err
@@ -412,24 +430,24 @@ func (x *cli) cluster(ctx context.Context, args []string) error {
 			return err
 		}
 		return x.print(cs, func(w io.Writer) {
-			fmt.Fprintln(w, "CLUSTER\tZONE\tCREATED\tLAST SEEN")
+			fmt.Fprintln(w, "CLUSTER\tZONES\tCREATED\tLAST SEEN")
 			for _, c := range cs {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", c.ID, c.Zone, ts(c.CreatedAt), ts(c.LastSeen))
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", c.ID, strings.Join(c.Zones, ","), ts(c.CreatedAt), ts(c.LastSeen))
 			}
 		})
 	case "add", "create":
-		if err := need(pos, 1, "cluster add <id> --zone <zone>"); err != nil {
+		if err := need(pos, 1, "cluster add <id> --zone <zone> [--zone <zone>...]"); err != nil {
 			return err
 		}
-		if *zone == "" {
-			return fmt.Errorf("--zone is required")
+		if len(zones) == 0 {
+			return fmt.Errorf("at least one --zone is required")
 		}
-		c, err := x.c.CreateCluster(ctx, pos[0], *zone)
+		c, err := x.c.CreateCluster(ctx, pos[0], zones)
 		if err != nil {
 			return err
 		}
 		return x.print(c, func(w io.Writer) {
-			fmt.Fprintf(w, "created cluster %s for zone %s\n", c.ID, c.Zone)
+			fmt.Fprintf(w, "created cluster %s for zones %s\n", c.ID, strings.Join(c.Zones, ", "))
 			fmt.Fprintf(w, "token (shown once, store it in the operator Secret):\n%s\n", c.Token)
 		})
 	case "rotate", "rotate-token":
@@ -455,4 +473,32 @@ func (x *cli) cluster(ctx context.Context, args []string) error {
 		})
 	}
 	return fmt.Errorf("unknown cluster subcommand %q", args[0])
+}
+
+// clusterZone handles `horus cluster zone add|rm <id> <zone>`.
+func (x *cli) clusterZone(ctx context.Context, args []string) error {
+	const usage = "cluster zone add|rm <cluster> <zone>"
+	if len(args) != 3 {
+		return fmt.Errorf("usage: horus %s", usage)
+	}
+	id, zone := args[1], args[2]
+	switch args[0] {
+	case "add":
+		c, err := x.c.AddClusterZone(ctx, id, zone)
+		if err != nil {
+			return err
+		}
+		return x.print(c, func(w io.Writer) {
+			fmt.Fprintf(w, "cluster %s now has zones %s\n", c.ID, strings.Join(c.Zones, ", "))
+		})
+	case "rm", "remove", "delete":
+		n, err := x.c.RemoveClusterZone(ctx, id, zone)
+		if err != nil {
+			return err
+		}
+		return x.print(api.RemoveClusterZoneResponse{RecordsRemoved: n}, func(w io.Writer) {
+			fmt.Fprintf(w, "removed zone %s from cluster %s (%d of its records deleted)\n", api.NormalizeName(zone), id, n)
+		})
+	}
+	return fmt.Errorf("usage: horus %s", usage)
 }

@@ -14,8 +14,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"github.com/Warewave-Technology/horus/pkg/api"
 	horus "github.com/Warewave-Technology/horus/pkg/client"
@@ -49,8 +51,15 @@ const (
 type IngressReconciler struct {
 	client.Client
 	Horus    Horus
-	Zone     string // the cluster's zone, from GET /v1/whoami
+	Zones    *Zones // the cluster's zones, from GET /v1/whoami
 	Recorder record.EventRecorder
+	// RefreshZones re-reads the zones from horus and reports whether they
+	// changed (ZoneWatcher.Refresh). Called when horus rejects a record set,
+	// which happens when a zone was removed since the last refresh. Optional.
+	RefreshZones func(context.Context) (bool, error)
+	// Events, when set, is watched as an extra source of reconcile requests
+	// (ZoneWatcher sends every opted-in Ingress when the zones change).
+	Events <-chan event.GenericEvent
 
 	// PendingRequeue is how often to re-check an Ingress that has no load
 	// balancer address yet. Status updates also trigger a reconcile.
@@ -80,7 +89,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, r.Horus.DeleteOwner(ctx, req.Namespace, req.Name)
 	}
 
-	plan, err := ingressdns.Desired(inputFrom(&ing), r.Zone)
+	plan, err := ingressdns.Desired(inputFrom(&ing), r.Zones.Get())
 	if err != nil {
 		// Malformed annotations: tell the user, do not touch existing records,
 		// do not requeue (the next edit of the Ingress triggers a reconcile).
@@ -98,6 +107,17 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	resp, err := r.Horus.ReplaceOwner(ctx, ing.Namespace, ing.Name, plan.Records)
 	if err != nil {
 		if horus.IsStatus(err, http.StatusUnprocessableEntity) {
+			// Most likely a zone was taken away from the cluster since we
+			// last looked. If so, the refresh requeues every Ingress.
+			if r.RefreshZones != nil {
+				changed, rerr := r.RefreshZones(ctx)
+				if rerr != nil {
+					return ctrl.Result{}, rerr
+				}
+				if changed {
+					return ctrl.Result{}, nil
+				}
+			}
 			r.Recorder.Event(&ing, corev1.EventTypeWarning, ReasonRejected, err.Error())
 			return ctrl.Result{}, nil
 		}
@@ -149,8 +169,11 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ConflictRequeue == 0 {
 		r.ConflictRequeue = 5 * time.Minute
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		Named("horus-ingress").
-		For(&networkingv1.Ingress{}, builder.WithPredicates(annotated())).
-		Complete(r)
+		For(&networkingv1.Ingress{}, builder.WithPredicates(annotated()))
+	if r.Events != nil {
+		b = b.WatchesRawSource(source.Channel(r.Events, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(r)
 }

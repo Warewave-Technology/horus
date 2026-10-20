@@ -57,6 +57,18 @@ func InZone(name, zone string) bool {
 	return name == zone || strings.HasSuffix(name, "."+zone)
 }
 
+// ZoneFor returns the most specific zone in zones that contains name, or "".
+// name and zones must be normalized.
+func ZoneFor(name string, zones []string) string {
+	best := ""
+	for _, z := range zones {
+		if InZone(name, z) && len(z) > len(best) {
+			best = z
+		}
+	}
+	return best
+}
+
 var clusterIDRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // ValidateClusterID checks a cluster id (DNS-label-like, max 63 chars).

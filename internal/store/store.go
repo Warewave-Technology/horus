@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,7 +24,14 @@ import (
 //go:embed schema.sql
 var schemaV1 string
 
-const schemaVersion = 1
+//go:embed migrate_v2.sql
+var migrateV2 string
+
+// migrations[i] takes the schema from version i to i+1. Never edit an
+// applied migration; append a new one.
+var migrations = []string{schemaV1, migrateV2}
+
+var schemaVersion = len(migrations)
 
 var (
 	// ErrNotFound is returned when the addressed object does not exist.
@@ -90,9 +99,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return nil
 	}
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		if v < 1 {
-			if _, err := tx.ExecContext(ctx, schemaV1); err != nil {
-				return err
+		for i := v; i < schemaVersion; i++ {
+			if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
+				return fmt.Errorf("schema v%d: %w", i+1, err)
 			}
 		}
 		_, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion))
@@ -246,7 +255,7 @@ func (s *Store) DeleteZone(ctx context.Context, actor, name string) error {
 			return err
 		}
 		var cluster string
-		err = tx.QueryRowContext(ctx, `SELECT id FROM clusters WHERE zone_id = ?`, z.ID).Scan(&cluster)
+		err = tx.QueryRowContext(ctx, `SELECT cluster_id FROM cluster_zones WHERE zone_id = ?`, z.ID).Scan(&cluster)
 		if err == nil {
 			return &ConflictError{Conflicts: []api.Conflict{{Name: name, HeldBy: "cluster:" + cluster}}}
 		}
@@ -404,23 +413,44 @@ func (s *Store) DeleteRecord(ctx context.Context, actor string, id int64) error 
 
 // ---------------------------------------------------------------- owners
 
-// ReplaceOwner makes the records of owner equal to desired, within zone.
-// Names held by other owners are skipped and reported (first-wins); everything
-// else is applied atomically.
-func (s *Store) ReplaceOwner(ctx context.Context, actor, zone, owner string, desired []api.Record) (api.OwnerRecordsResponse, error) {
+// ReplaceOwner makes the records of owner equal to desired. Every record must
+// lie in one of the zones of cluster, read inside the transaction so that a
+// concurrent `cluster zone rm` cannot be undone. Names held by other owners
+// are skipped and reported (first-wins); everything else is applied
+// atomically.
+func (s *Store) ReplaceOwner(ctx context.Context, actor, cluster, owner string, desired []api.Record) (api.OwnerRecordsResponse, error) {
 	var resp api.OwnerRecordsResponse
 	ts := s.ts()
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		z, err := zoneByName(ctx, tx, api.NormalizeName(zone))
+		if !strings.HasPrefix(owner, cluster+"/") {
+			return fmt.Errorf("owner %q is not under cluster %q", owner, cluster)
+		}
+		allowed, err := clusterZones(ctx, tx, cluster)
 		if err != nil {
 			return err
 		}
-		names := map[string]bool{}
-		for i := range desired {
-			if err := api.ValidateRecord(&desired[i], z.Name); err != nil {
+		if len(allowed) == 0 {
+			return fmt.Errorf("cluster %q: %w", cluster, ErrNotFound)
+		}
+		zoneIDs := map[string]int64{}
+		for _, name := range allowed {
+			z, err := zoneByName(ctx, tx, name)
+			if err != nil {
 				return err
 			}
-			desired[i].Zone, desired[i].Owner = z.Name, owner
+			zoneIDs[z.Name] = z.ID
+		}
+		names := map[string]bool{}
+		for i := range desired {
+			zn := api.ZoneFor(api.NormalizeName(desired[i].Name), allowed)
+			if zn == "" {
+				return fmt.Errorf("%w: name %q is outside the cluster's zones (%s)",
+					api.ErrInvalid, desired[i].Name, strings.Join(allowed, ", "))
+			}
+			if err := api.ValidateRecord(&desired[i], zn); err != nil {
+				return err
+			}
+			desired[i].Zone, desired[i].Owner = zn, owner
 			names[desired[i].Name] = true
 		}
 		if err := api.ValidateRRSet(desired); err != nil {
@@ -456,19 +486,22 @@ func (s *Store) ReplaceOwner(ctx context.Context, actor, zone, owner string, des
 			touched[zid] = true
 		}
 		for _, r := range p.update {
-			if _, err := tx.ExecContext(ctx, `UPDATE records SET ttl = ?, updated_at = ? WHERE id = ?`, r.TTL, ts, r.ID); err != nil {
+			var zid int64
+			if err := tx.QueryRowContext(ctx, `UPDATE records SET ttl = ?, updated_at = ? WHERE id = ? RETURNING zone_id`,
+				r.TTL, ts, r.ID).Scan(&zid); err != nil {
 				return err
 			}
-			touched[z.ID] = true
+			touched[zid] = true
 		}
 		for _, r := range p.insert {
+			zid := zoneIDs[r.Zone]
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO records (zone_id, name, type, data, ttl, owner, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-				z.ID, r.Name, string(r.Type), r.Data, r.TTL, owner, ts, ts); err != nil {
+				zid, r.Name, string(r.Type), r.Data, r.TTL, owner, ts, ts); err != nil {
 				return err
 			}
-			touched[z.ID] = true
+			touched[zid] = true
 		}
 		resp.Added, resp.Updated, resp.Removed = len(p.insert), len(p.update), len(p.delete)
 		for zid := range touched {
@@ -544,51 +577,207 @@ func (s *Store) ListOwners(ctx context.Context, prefix string) ([]string, error)
 
 // ---------------------------------------------------------------- clusters
 
-// ListClusters returns all clusters (without tokens).
+// ListClusters returns all clusters (without tokens) with their zones.
 func (s *Store) ListClusters(ctx context.Context) ([]api.Cluster, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT c.id, z.name, c.created_at, COALESCE(c.last_seen, 0)
-		 FROM clusters c JOIN zones z ON z.id = c.zone_id ORDER BY c.id`)
+		`SELECT id, created_at, COALESCE(last_seen, 0) FROM clusters ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	var out []api.Cluster
+	idx := map[string]int{}
+	for rows.Next() {
+		var c api.Cluster
+		if err := rows.Scan(&c.ID, &c.CreatedAt, &c.LastSeen); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		idx[c.ID] = len(out)
+		out = append(out, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows, err = s.db.QueryContext(ctx,
+		`SELECT cz.cluster_id, z.name FROM cluster_zones cz JOIN zones z ON z.id = cz.zone_id ORDER BY z.name`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []api.Cluster
 	for rows.Next() {
-		var c api.Cluster
-		if err := rows.Scan(&c.ID, &c.Zone, &c.CreatedAt, &c.LastSeen); err != nil {
+		var id, zone string
+		if err := rows.Scan(&id, &zone); err != nil {
 			return nil, err
 		}
-		out = append(out, c)
+		if i, ok := idx[id]; ok {
+			out[i].Zones = append(out[i].Zones, zone)
+		}
 	}
 	return out, rows.Err()
 }
 
-// CreateCluster binds a new cluster to a zone. tokenHash is sha256(token).
-func (s *Store) CreateCluster(ctx context.Context, actor, id, zone string, tokenHash []byte) (api.Cluster, error) {
-	c := api.Cluster{ID: id, Zone: api.NormalizeName(zone)}
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// clusterZones returns the zones of a cluster, sorted.
+func clusterZones(ctx context.Context, q queryer, id string) ([]string, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT z.name FROM cluster_zones cz JOIN zones z ON z.id = cz.zone_id
+		 WHERE cz.cluster_id = ? ORDER BY z.name`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func clusterExists(ctx context.Context, tx *sql.Tx, id string) error {
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM clusters WHERE id = ?`, id).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("cluster %q: %w", id, ErrNotFound)
+	}
+	return err
+}
+
+// assignZone gives zone z to cluster id. A zone belongs to at most one cluster.
+func assignZone(ctx context.Context, tx *sql.Tx, id string, z api.Zone) error {
+	var holder string
+	err := tx.QueryRowContext(ctx, `SELECT cluster_id FROM cluster_zones WHERE zone_id = ?`, z.ID).Scan(&holder)
+	switch {
+	case err == nil && holder == id:
+		return fmt.Errorf("cluster %q already has zone %q: %w", id, z.Name, ErrExists)
+	case err == nil:
+		return fmt.Errorf("zone %q belongs to cluster %q: %w", z.Name, holder, ErrExists)
+	case !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO cluster_zones (cluster_id, zone_id) VALUES (?, ?)`, id, z.ID)
+	return err
+}
+
+// CreateCluster creates a cluster that may write to zones (at least one).
+// tokenHash is sha256(token).
+func (s *Store) CreateCluster(ctx context.Context, actor, id string, zones []string, tokenHash []byte) (api.Cluster, error) {
+	c := api.Cluster{ID: id}
 	if err := api.ValidateClusterID(id); err != nil {
 		return c, err
 	}
+	seen := map[string]bool{}
+	for _, z := range zones {
+		if z = api.NormalizeName(z); z != "" && !seen[z] {
+			seen[z] = true
+			c.Zones = append(c.Zones, z)
+		}
+	}
+	if len(c.Zones) == 0 {
+		return c, fmt.Errorf("%w: a cluster needs at least one zone", api.ErrInvalid)
+	}
+	sort.Strings(c.Zones)
 	ts := s.ts()
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		z, err := zoneByName(ctx, tx, c.Zone)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx,
-			`INSERT INTO clusters (id, zone_id, token_hash, created_at) VALUES (?, ?, ?, ?)`,
-			id, z.ID, tokenHash, ts)
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO clusters (id, token_hash, created_at) VALUES (?, ?, ?)`, id, tokenHash, ts)
 		if isUnique(err) {
-			return fmt.Errorf("cluster %q or a cluster for zone %q: %w", id, c.Zone, ErrExists)
+			return fmt.Errorf("cluster %q: %w", id, ErrExists)
 		}
 		if err != nil {
 			return err
+		}
+		for _, name := range c.Zones {
+			z, err := zoneByName(ctx, tx, name)
+			if err != nil {
+				return err
+			}
+			if err := assignZone(ctx, tx, id, z); err != nil {
+				return err
+			}
 		}
 		c.CreatedAt = ts
-		return audit(ctx, tx, ts, actor, "cluster.create", id, map[string]string{"zone": c.Zone})
+		return audit(ctx, tx, ts, actor, "cluster.create", id, map[string]any{"zones": c.Zones})
 	})
 	return c, err
+}
+
+// AddClusterZone gives one more zone to a cluster and returns the cluster.
+func (s *Store) AddClusterZone(ctx context.Context, actor, id, zone string) (api.Cluster, error) {
+	zone = api.NormalizeName(zone)
+	ts := s.ts()
+	var c api.Cluster
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := clusterExists(ctx, tx, id); err != nil {
+			return err
+		}
+		z, err := zoneByName(ctx, tx, zone)
+		if err != nil {
+			return err
+		}
+		if err := assignZone(ctx, tx, id, z); err != nil {
+			return err
+		}
+		if c.Zones, err = clusterZones(ctx, tx, id); err != nil {
+			return err
+		}
+		c.ID = id
+		return audit(ctx, tx, ts, actor, "cluster.zone.add", id, map[string]string{"zone": z.Name})
+	})
+	return c, err
+}
+
+// RemoveClusterZone takes a zone away from a cluster and deletes the records
+// the cluster owns in it. It returns how many records were removed. The last
+// zone of a cluster cannot be removed (delete the cluster instead).
+func (s *Store) RemoveClusterZone(ctx context.Context, actor, id, zone string) (int, error) {
+	zone = api.NormalizeName(zone)
+	ts := s.ts()
+	var removed int64
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := clusterExists(ctx, tx, id); err != nil {
+			return err
+		}
+		zones, err := clusterZones(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(zones, zone) {
+			return fmt.Errorf("cluster %q has no zone %q: %w", id, zone, ErrNotFound)
+		}
+		if len(zones) == 1 {
+			return fmt.Errorf("%w: %q is the last zone of cluster %q; delete the cluster instead", api.ErrInvalid, zone, id)
+		}
+		z, err := zoneByName(ctx, tx, zone)
+		if err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM records WHERE zone_id = ? AND substr(owner, 1, ?) = ?`, z.ID, len(id)+1, id+"/")
+		if err != nil {
+			return err
+		}
+		removed, _ = res.RowsAffected()
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM cluster_zones WHERE cluster_id = ? AND zone_id = ?`, id, z.ID); err != nil {
+			return err
+		}
+		if removed > 0 {
+			if err := bumpSerial(ctx, tx, z.ID, ts); err != nil {
+				return err
+			}
+		}
+		return audit(ctx, tx, ts, actor, "cluster.zone.remove", id,
+			map[string]any{"zone": z.Name, "records_removed": removed})
+	})
+	return int(removed), err
 }
 
 // RotateClusterToken replaces a cluster's token hash.
@@ -606,30 +795,43 @@ func (s *Store) RotateClusterToken(ctx context.Context, actor, id string, tokenH
 	})
 }
 
-// DeleteCluster removes a cluster and every record it owns.
+// DeleteCluster removes a cluster, its zone assignments and every record it owns.
 func (s *Store) DeleteCluster(ctx context.Context, actor, id string) error {
 	ts := s.ts()
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		var zoneID int64
-		err := tx.QueryRowContext(ctx, `SELECT zone_id FROM clusters WHERE id = ?`, id).Scan(&zoneID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("cluster %q: %w", id, ErrNotFound)
+		if err := clusterExists(ctx, tx, id); err != nil {
+			return err
 		}
+		rows, err := tx.QueryContext(ctx,
+			`DELETE FROM records WHERE substr(owner, 1, ?) = ? RETURNING zone_id`, len(id)+1, id+"/")
 		if err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM records WHERE substr(owner, 1, ?) = ?`, len(id)+1, id+"/")
-		if err != nil {
+		touched := map[int64]bool{}
+		removed := 0
+		for rows.Next() {
+			var zid int64
+			if err := rows.Scan(&zid); err != nil {
+				rows.Close()
+				return err
+			}
+			touched[zid] = true
+			removed++
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			return err
 		}
-		removed, _ := res.RowsAffected()
+		// cluster_zones rows go with the cluster (ON DELETE CASCADE).
 		if _, err := tx.ExecContext(ctx, `DELETE FROM clusters WHERE id = ?`, id); err != nil {
 			return err
 		}
-		if err := bumpSerial(ctx, tx, zoneID, ts); err != nil {
-			return err
+		for zid := range touched {
+			if err := bumpSerial(ctx, tx, zid, ts); err != nil {
+				return err
+			}
 		}
-		return audit(ctx, tx, ts, actor, "cluster.delete", id, map[string]int64{"records_removed": removed})
+		return audit(ctx, tx, ts, actor, "cluster.delete", id, map[string]int{"records_removed": removed})
 	})
 }
 
@@ -639,19 +841,19 @@ func (s *Store) DeleteCluster(ctx context.Context, actor, id string) error {
 const lastSeenInterval = time.Minute
 
 // ClusterByTokenHash authenticates a cluster token and records last_seen
-// (at most once per lastSeenInterval).
+// (at most once per lastSeenInterval). The cluster comes with its zones.
 func (s *Store) ClusterByTokenHash(ctx context.Context, tokenHash []byte) (api.Cluster, error) {
 	var c api.Cluster
-	err := s.db.QueryRowContext(ctx,
-		`SELECT c.id, z.name FROM clusters c JOIN zones z ON z.id = c.zone_id WHERE c.token_hash = ?`,
-		tokenHash).Scan(&c.ID, &c.Zone)
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM clusters WHERE token_hash = ?`, tokenHash).Scan(&c.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return c, ErrNotFound
 	}
 	if err != nil {
 		return c, err
 	}
-	// Best effort; a failed last_seen update must not fail authentication.
+	if c.Zones, err = clusterZones(ctx, s.db, c.ID); err != nil {
+		return c, err
+	}
 	// This bookkeeping write bypasses httpapi's write lock on purpose: it
 	// changes nothing the DNS snapshot depends on.
 	ts := s.ts()

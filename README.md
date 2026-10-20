@@ -61,9 +61,10 @@ simplicity.
 - **REST API and CLI** for zones, records, clusters and backups. An admin
   token is used on a local unix socket, and per-cluster tokens over TCP (TLS).
 - **Kubernetes operator**: one per cluster, leader-elected. Annotate an
-  Ingress and its hosts are registered. Supports multiple clusters, one zone
-  per cluster, first-wins name ownership, and garbage collection of anything
-  missed while the operator was down.
+  Ingress and its hosts are registered. Supports multiple clusters, several
+  zones per cluster (added or removed at runtime, no operator restart),
+  first-wins name ownership, and garbage collection of anything missed while
+  the operator was down.
 - **Operations**: systemd `Type=notify` with watchdog, `DynamicUser` and a
   strict sandbox. Online backups (`VACUUM INTO`) with a daily timer.
   Prometheus metrics, JSON logs to journald, an audit log of every write.
@@ -87,7 +88,7 @@ These are deliberate decisions (see the "Decisions" table in
 | Recursive resolution | horus forwards to recursive resolvers; it does not walk the DNS tree itself. |
 | Zone transfers (AXFR/IXFR), NS records, delegation | horus does not serve NS records at the apex, so its zones cannot be delegated from a parent zone. Clients must use horus as their resolver (directly, or through a conditional forwarder). |
 | Overlapping zones (`a.example` and `b.a.example`) | Rejected, so every name maps to exactly one zone and one owner. |
-| More than one zone per cluster | Each cluster token is bound to exactly one zone. |
+| One zone shared by several clusters | A zone belongs to at most one cluster (a cluster may have many zones). Give each cluster its own zones; cross-cluster names can still be joined with manual CNAMEs. |
 
 ## How it works
 
@@ -211,8 +212,9 @@ Port 53 then needs root or `setcap cap_net_bind_service=+ep /usr/local/bin/horus
 ## First steps
 
 ```sh
-# Zones (one per cluster, plus any you manage by hand)
+# Zones (each cluster gets one or more, plus any you manage by hand)
 horus zone add prod.internal.example
+horus zone add edge.internal.example
 horus zone add staging.internal.example --ttl 60
 
 # Manual records
@@ -224,8 +226,14 @@ dig @127.0.0.1 pg.prod.internal.example
 #   pg.prod.internal.example.  300  IN  CNAME  db.prod.internal.example.
 #   db.prod.internal.example.  300  IN  A      10.0.0.5
 
-# A token for a cluster's operator (printed once; store it in a Secret)
-horus cluster add prod --zone prod.internal.example
+# A token for a cluster's operator (printed once; store it in a Secret).
+# The cluster may register names in all of its zones.
+horus cluster add prod --zone prod.internal.example --zone edge.internal.example
+
+# Zones can be given to or taken from a cluster later; the operator follows
+# within a minute, without a restart.
+horus cluster zone add prod staging.internal.example
+horus cluster zone rm prod staging.internal.example
 ```
 
 Then [deploy the operator](#deploying-the-operator) into that cluster and
@@ -311,13 +319,16 @@ horus record rm <id>                          manual records only (ids from `rec
 
 horus owners [zone] [--owner OWNER]           who holds which names: owner, record count, names, last change
 
-horus cluster ls                              id, zone, created, last seen (precision: 1 minute)
-horus cluster add <id> --zone <zone>          prints the cluster token once
+horus cluster ls                              id, zones, created, last seen (precision: 1 minute)
+horus cluster add <id> --zone <zone> [--zone <zone>...]
+                                              prints the cluster token once; --zone a,b also works
+horus cluster zone add <id> <zone>            let the cluster write to one more zone
+horus cluster zone rm <id> <zone>             take a zone away; deletes the cluster's records in it
 horus cluster rotate <id>                     prints a new token; the old one stops working immediately
 horus cluster rm <id>                         deletes the cluster and every record it owns
 
 horus backup                                  consistent DB copy on the server; prints its path
-horus whoami                                  "admin" or "cluster <id> (zone <zone>)"
+horus whoami                                  "admin" or "cluster <id> (zones <zone>, ...)"
 ```
 
 Details:
@@ -466,7 +477,7 @@ Every record has an **owner**:
 | Owner | Created by | Can be removed by |
 |---|---|---|
 | `manual` | admin token (CLI) | `horus record rm <id>`, `horus zone rm` |
-| `<cluster>/<namespace>/<ingress>` | that cluster's operator | the operator (Ingress deleted/changed/opted out), garbage collection, `horus cluster rm`, `horus zone rm` |
+| `<cluster>/<namespace>/<ingress>` | that cluster's operator | the operator (Ingress deleted/changed/opted out), garbage collection, `horus cluster rm`, `horus cluster zone rm` (records in that zone) |
 
 Rules, enforced inside the write transaction:
 
@@ -481,15 +492,20 @@ Rules, enforced inside the write transaction:
    name.
 3. **Manual records cannot be deleted by operators**, and operator records
    cannot be deleted with `horus record rm` (`409`).
-4. **A cluster token can only write in its own zone** and under its own
+4. **A cluster token can only write in its own zones** and under its own
    owner prefix. The prefix comes from the token, never from the request.
+   One Ingress may hold names in several of the cluster's zones. Each record
+   is stored in the cluster zone that contains it.
+5. **A zone belongs to at most one cluster**, and a cluster keeps at least one
+   zone. A zone that belongs to a cluster cannot be deleted.
 
 ### Audit log
 
 Every write appends a row to the `audit_log` table: timestamp, actor
 (`admin` or `cluster:<id>`), action (`zone.create`, `zone.delete`,
 `record.create`, `record.delete`, `owner.replace`, `owner.delete`,
-`cluster.create`, `cluster.rotate`, `cluster.delete`) and a JSON detail.
+`cluster.create`, `cluster.zone.add`, `cluster.zone.remove`, `cluster.rotate`,
+`cluster.delete`) and a JSON detail.
 Operator reconciles that change nothing are not logged, unless they report
 conflicts (then one row per retry, every 5 minutes). There is no CLI for
 it yet. Read it with `sqlite3`, which is safe while horus runs because of WAL:
@@ -502,7 +518,13 @@ sqlite3 -readonly /var/lib/horus/horus.db \
 ## Kubernetes operator
 
 One operator runs per cluster. It authenticates with that cluster's token
-and learns its cluster id and zone from `GET /v1/whoami` at startup.
+and learns its cluster id and zones from `GET /v1/whoami` at startup.
+
+The zones are read again every minute (`--zone-refresh`), and immediately
+when horus rejects a record set. When they change, every opted-in Ingress is
+reconciled again. Hosts in a newly added zone get registered, and hosts in a
+removed zone are dropped. `horus cluster zone add|rm` therefore takes effect
+within a minute, without restarting the operator.
 
 ### Annotations
 
@@ -545,7 +567,7 @@ More examples are in
   and de-duplicated. Rules without a host are ignored. Names are skipped,
   with a `HostSkipped` warning event, when:
   - they are wildcards (`*.zone`)
-  - they are outside the cluster's zone
+  - they are outside all of the cluster's zones
   - they are the zone apex and the target would be a CNAME
 - **Targets**: `status.loadBalancer.ingress[]` (or the `target` annotation).
   - IPs become A/AAAA records (IPv4-mapped IPv6 is unmapped). Several IPs
@@ -567,9 +589,9 @@ More examples are in
 |---|---|---|
 | `Registered` | Normal | Records were added, updated or removed (with counts). |
 | `HostnameConflict` | Warning | A name is held by another owner. It is retried every 5 minutes. |
-| `HostSkipped` | Warning | A host was skipped (wildcard, outside the zone, CNAME at the apex). |
+| `HostSkipped` | Warning | A host was skipped (wildcard, outside the cluster's zones, CNAME at the apex). |
 | `InvalidAnnotation` | Warning | An annotation is malformed. Nothing changes on the server and there is no retry. Fixing the Ingress triggers a new reconcile. |
-| `Rejected` | Warning | The server refused the record set (`422`). No retry. |
+| `Rejected` | Warning | The server refused the record set (`422`) and the cluster's zones did not change. No retry. (If the zones did change, for example a zone was just removed, there is no event: all Ingresses are reconciled again with the new zones.) |
 
 ```sh
 kubectl describe ingress web          # events at the bottom
@@ -656,6 +678,7 @@ The image is `distroless/static:nonroot` with a single static binary.
 | `--leader-elect` | `true` | Leader election (needed with more than one replica). |
 | `--gc-interval` | `5m` | Garbage collection interval. |
 | `--pending-requeue` | `30s` | Re-check interval for Ingresses without an LB address. |
+| `--zone-refresh` | `1m` | How often to re-read the cluster's zones from horus. |
 | `--metrics-bind-address` | `:8080` | controller-runtime metrics. `0` disables. |
 | `--health-probe-bind-address` | `:8081` | `/healthz` (process alive) and `/readyz` (horus reachable: calls `whoami`). |
 | `--zap-*` | | Logging flags (`--zap-log-level=debug`, `--zap-devel`, …). |
@@ -663,7 +686,13 @@ The image is `distroless/static:nonroot` with a single static binary.
 Startup fails fast, and Kubernetes restarts the pod, when:
 - horus is unreachable or the token is invalid (`whoami`, 15s timeout);
 - the token is an admin token. The operator refuses it: it needs a cluster
-  token.
+  token;
+- the cluster has no zones.
+
+Compatibility: an operator from v0.2.0 or later also works against an older
+server (it then uses the single `zone` from `whoami`). An older operator
+works against a newer server, but only registers names in the cluster's
+first zone (alphabetical). Upgrade the server first, then the operators.
 
 ## REST API
 
@@ -678,6 +707,8 @@ The full contract is in [docs/API.md](docs/API.md). Summary:
 | GET, POST | `/v1/zones/{zone}/records` | admin |
 | DELETE | `/v1/records/{id}` | admin |
 | GET, POST | `/v1/clusters` | admin |
+| POST | `/v1/clusters/{id}/zones` | admin |
+| DELETE | `/v1/clusters/{id}/zones/{zone}` | admin |
 | POST | `/v1/clusters/{id}/rotate-token` | admin |
 | DELETE | `/v1/clusters/{id}` | admin |
 | POST | `/v1/backup` | admin |
@@ -706,8 +737,9 @@ The Go client used by the CLI and the operator is
   socket `0660`, both owned by the dynamic service user).
 - **Cluster tokens**: `hrs_` + 32 random bytes (base64url). They are shown
   once and stored only as SHA-256. Each token is bound to one cluster id and
-  one zone. A leaked cluster token can change only that cluster's records in
-  that zone, never manual records or names held by other owners.
+  that cluster's zones. A leaked cluster token can change only that cluster's
+  records in those zones, never manual records or names held by other owners.
+  Zones are assigned only with the admin token.
 - **Transport**: the operator API sends bearer tokens. Use TLS on
   `HORUS_API_LISTEN`. horus warns at start when the TCP listener has no TLS.
 - **Unauthenticated endpoints**: `/healthz` and `/metrics`, on every API
@@ -818,11 +850,29 @@ operator.
   systemctl restart horus
   ```
 
+### Cluster zones
+
+```sh
+horus zone add edge.internal.example
+horus cluster zone add prod edge.internal.example    # prod's operator registers edge names within a minute
+horus cluster zone rm prod edge.internal.example     # deletes prod's records in edge; manual records stay
+horus cluster ls                                     # CLUSTER  ZONES  CREATED  LAST SEEN
+```
+
+- A zone belongs to at most one cluster (`409` otherwise). To move a zone
+  from one cluster to another, remove it from the first (its records there
+  are deleted), then add it to the second. The second operator registers
+  its Ingresses within a minute.
+- A cluster keeps at least one zone. Removing the last one is refused
+  (`422`); delete the cluster instead.
+- Between `cluster zone rm` and the operator's next refresh, a reconcile may
+  briefly get a `422`. The operator then refreshes its zones on the spot.
+
 ### Removing a cluster or zone
 
 ```sh
 horus cluster rm prod                  # also deletes every record owned by prod/...
-horus zone rm prod.internal.example    # refused while a cluster is bound; deletes all records of the zone
+horus zone rm prod.internal.example    # refused while it belongs to a cluster; deletes all records of the zone
 ```
 
 Uninstall the operator from the cluster first. Otherwise its garbage
@@ -870,7 +920,13 @@ systemctl restart horus
 ```
 
 Schema migrations run automatically at start (tracked with
-`PRAGMA user_version`). Take a backup first.
+`PRAGMA user_version`). Take a backup first: there is no automatic downgrade,
+and an older binary cannot open a migrated database. To go back, restore the
+backup taken before the upgrade.
+
+- **v0.1 → v0.2**: clusters can own several zones (schema version 2).
+  Existing clusters keep their zone and token. Upgrade the server first, then
+  the operators (see [operator compatibility](#operator-flags)).
 
 ## Troubleshooting
 
@@ -885,6 +941,9 @@ Schema migrations run automatically at start (tracked with
 | New name gives NXDOMAIN for up to 30s | The client cached the earlier NXDOMAIN. This is expected (SOA MINIMUM ≤ 30s). |
 | Ingress not registered | `kubectl describe ingress`: look for events. No events at all → missing `register: "true"` annotation, or the operator is not running. `waiting for a load balancer address` in operator logs → the ingress controller has not published `status.loadBalancer`. Use the `target` annotation if it never will. |
 | `HostnameConflict` | `horus owners` shows who holds the name. Remove that record or Ingress. The operator picks the name up within 5 minutes. |
+| `HostSkipped: ... outside the cluster's zones` | The host's zone is not assigned to this cluster: `horus cluster zone add <cluster> <zone>` (create the zone first if needed). It is picked up within a minute. |
+| `zone ... belongs to cluster ...` | A zone has at most one cluster. Remove it from the other cluster first. |
+| `cluster ... has no zones` at operator start | Give the cluster a zone: `horus cluster zone add`. |
 | Operator `CrashLoopBackOff`, `whoami: ...` | Wrong `HORUS_URL`, TLS trust (`--ca-file`), network/firewall to port 8053, or wrong/rotated token. |
 | `the token is an admin token` | The operator needs a cluster token (`horus cluster add`). |
 | Forwarded names SERVFAIL | Every upstream failed. Check `horus_upstream_errors_total` and reachability of `HORUS_UPSTREAMS`. |

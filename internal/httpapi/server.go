@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,11 +37,14 @@ type Store interface {
 	ListRecords(ctx context.Context, zone string) ([]api.Record, error)
 	AddRecord(ctx context.Context, actor string, r api.Record) (api.Record, error)
 	DeleteRecord(ctx context.Context, actor string, id int64) error
-	ReplaceOwner(ctx context.Context, actor, zone, owner string, recs []api.Record) (api.OwnerRecordsResponse, error)
+	// ReplaceOwner reads the cluster's zones itself, inside the write.
+	ReplaceOwner(ctx context.Context, actor, cluster, owner string, recs []api.Record) (api.OwnerRecordsResponse, error)
 	DeleteOwner(ctx context.Context, actor, owner string) (int, error)
 	ListOwners(ctx context.Context, prefix string) ([]string, error)
 	ListClusters(ctx context.Context) ([]api.Cluster, error)
-	CreateCluster(ctx context.Context, actor, id, zone string, tokenHash []byte) (api.Cluster, error)
+	CreateCluster(ctx context.Context, actor, id string, zones []string, tokenHash []byte) (api.Cluster, error)
+	AddClusterZone(ctx context.Context, actor, id, zone string) (api.Cluster, error)
+	RemoveClusterZone(ctx context.Context, actor, id, zone string) (int, error)
 	RotateClusterToken(ctx context.Context, actor, id string, tokenHash []byte) error
 	DeleteCluster(ctx context.Context, actor, id string) error
 	ClusterByTokenHash(ctx context.Context, tokenHash []byte) (api.Cluster, error)
@@ -105,6 +109,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/clusters", admin(s.createCluster))
 	mux.Handle("POST /v1/clusters/{id}/rotate-token", admin(s.rotateCluster))
 	mux.Handle("DELETE /v1/clusters/{id}", admin(s.deleteCluster))
+	mux.Handle("POST /v1/clusters/{id}/zones", admin(s.addClusterZone))
+	mux.Handle("DELETE /v1/clusters/{id}/zones/{zone}", admin(s.removeClusterZone))
 
 	mux.Handle("POST /v1/backup", admin(s.backup))
 
@@ -276,7 +282,11 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 // ---------------------------------------------------------------- handlers
 
 func (s *Server) whoami(w http.ResponseWriter, _ *http.Request, id identity) error {
-	writeJSON(w, http.StatusOK, api.WhoAmI{Admin: id.admin, Cluster: id.cluster.ID, Zone: id.cluster.Zone})
+	who := api.WhoAmI{Admin: id.admin, Cluster: id.cluster.ID, Zones: id.cluster.Zones}
+	if len(who.Zones) > 0 {
+		who.Zone = who.Zones[0]
+	}
+	writeJSON(w, http.StatusOK, who)
 	return nil
 }
 
@@ -389,7 +399,7 @@ func (s *Server) createCluster(w http.ResponseWriter, r *http.Request, id identi
 	}
 	var c api.Cluster
 	if err := s.write(r.Context(), func() (err error) {
-		c, err = s.opt.Store.CreateCluster(r.Context(), id.actor(), req.ID, req.Zone, HashToken(tok))
+		c, err = s.opt.Store.CreateCluster(r.Context(), id.actor(), req.ID, req.Zones, HashToken(tok))
 		return err
 	}); err != nil {
 		return err
@@ -421,6 +431,36 @@ func (s *Server) deleteCluster(w http.ResponseWriter, r *http.Request, id identi
 		return err
 	}
 	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+func (s *Server) addClusterZone(w http.ResponseWriter, r *http.Request, id identity) error {
+	var req api.ClusterZoneRequest
+	if err := decode(r, &req); err != nil {
+		return err
+	}
+	var c api.Cluster
+	// Like every write, this goes through s.write (no DNS change, so the
+	// reload is a cheap no-op in effect).
+	if err := s.write(r.Context(), func() (err error) {
+		c, err = s.opt.Store.AddClusterZone(r.Context(), id.actor(), r.PathValue("id"), req.Zone)
+		return err
+	}); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, c)
+	return nil
+}
+
+func (s *Server) removeClusterZone(w http.ResponseWriter, r *http.Request, id identity) error {
+	var n int
+	if err := s.write(r.Context(), func() (err error) {
+		n, err = s.opt.Store.RemoveClusterZone(r.Context(), id.actor(), r.PathValue("id"), r.PathValue("zone"))
+		return err
+	}); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, api.RemoveClusterZoneResponse{RecordsRemoved: n})
 	return nil
 }
 
@@ -496,14 +536,14 @@ func (s *Server) replaceOwner(w http.ResponseWriter, r *http.Request, id identit
 		return err
 	}
 	for _, rec := range req.Records {
-		if rec.ID != 0 || rec.Owner != "" || (rec.Zone != "" && api.NormalizeName(rec.Zone) != id.cluster.Zone) {
+		if rec.ID != 0 || rec.Owner != "" || (rec.Zone != "" && !slices.Contains(id.cluster.Zones, api.NormalizeName(rec.Zone))) {
 			return fmt.Errorf("%w: id/owner/zone are set by the server", api.ErrInvalid)
 		}
 	}
 	var resp api.OwnerRecordsResponse
 	if err := s.writeIf(r.Context(), func() (bool, error) {
 		var err error
-		resp, err = s.opt.Store.ReplaceOwner(r.Context(), id.actor(), id.cluster.Zone, owner, req.Records)
+		resp, err = s.opt.Store.ReplaceOwner(r.Context(), id.actor(), id.cluster.ID, owner, req.Records)
 		return resp.Changed(), err
 	}); err != nil {
 		return err

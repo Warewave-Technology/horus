@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -15,7 +17,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"sigs.k8s.io/controller-runtime/pkg/event"
+
 	"github.com/Warewave-Technology/horus/pkg/api"
+	horus "github.com/Warewave-Technology/horus/pkg/client"
 	"github.com/Warewave-Technology/horus/pkg/ingressdns"
 )
 
@@ -23,6 +28,14 @@ type fakeHorus struct {
 	mu        sync.Mutex
 	owners    map[string][]api.Record // "ns/name" -> records
 	conflicts map[string]string       // name -> holder, returned as conflicts
+	whoami    api.WhoAmI
+	reject    bool // answer ReplaceOwner with 422
+}
+
+func (f *fakeHorus) WhoAmI(context.Context) (api.WhoAmI, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.whoami, nil
 }
 
 func newFakeHorus() *fakeHorus {
@@ -33,6 +46,9 @@ func (f *fakeHorus) ReplaceOwner(_ context.Context, ns, name string, recs []api.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var resp api.OwnerRecordsResponse
+	if f.reject {
+		return resp, &horus.APIError{Status: http.StatusUnprocessableEntity, Body: api.Error{Error: "invalid: outside the cluster's zones"}}
+	}
 	var kept []api.Record
 	for _, r := range recs {
 		if h, ok := f.conflicts[r.Name]; ok {
@@ -91,7 +107,7 @@ func setup(t *testing.T, objs ...*networkingv1.Ingress) (*IngressReconciler, *fa
 	h := newFakeHorus()
 	rec := record.NewFakeRecorder(100)
 	return &IngressReconciler{
-		Client: b.Build(), Horus: h, Zone: "prod.internal.example.", Recorder: rec,
+		Client: b.Build(), Horus: h, Zones: NewZones([]string{"prod.internal.example."}), Recorder: rec,
 		PendingRequeue: 1, ConflictRequeue: 2,
 	}, h, rec
 }
@@ -190,5 +206,87 @@ func TestGarbageCollector(t *testing.T) {
 	}
 	if _, ok := h.owners["default/keep"]; !ok || len(h.owners) != 1 {
 		t.Fatalf("owners left: %v", h.owners)
+	}
+}
+
+func TestSeveralZones(t *testing.T) {
+	r, h, rec := setup(t, ingress("web", true,
+		[]string{"web.prod.internal.example", "web.edge.example", "x.other.example"}, "10.0.0.1"))
+	r.Zones.Set([]string{"prod.internal.example.", "edge.example."})
+	reconcile(t, r, "web")
+	var names []string
+	for _, rr := range h.owners["default/web"] {
+		names = append(names, rr.Name)
+	}
+	if strings.Join(names, ",") != "web.edge.example.,web.prod.internal.example." {
+		t.Fatalf("records: %v", names)
+	}
+	if events := strings.Join(drain(rec), "\n"); !strings.Contains(events, "x.other.example") {
+		t.Fatalf("expected the out-of-zone host to be skipped: %s", events)
+	}
+}
+
+func TestZonesOf(t *testing.T) {
+	if got := ZonesOf(api.WhoAmI{Zones: []string{"b.", "a."}, Zone: "b."}); strings.Join(got, ",") != "a.,b." {
+		t.Fatalf("zones: %v", got)
+	}
+	// Servers older than v0.2.0 only send "zone".
+	if got := ZonesOf(api.WhoAmI{Zone: "a."}); strings.Join(got, ",") != "a." {
+		t.Fatalf("legacy zone: %v", got)
+	}
+	if got := ZonesOf(api.WhoAmI{}); len(got) != 0 {
+		t.Fatalf("no zones: %v", got)
+	}
+}
+
+func TestZoneWatcherRequeuesOnChange(t *testing.T) {
+	r, h, _ := setup(t,
+		ingress("a", true, nil, ""),
+		ingress("b", true, nil, ""),
+		ingress("off", false, nil, ""),
+	)
+	events := make(chan event.GenericEvent, 10)
+	w := &ZoneWatcher{Horus: h, Zones: r.Zones, Reader: r.Client, Events: events}
+
+	h.whoami = api.WhoAmI{Cluster: "prod", Zones: []string{"prod.internal.example."}}
+	if changed, err := w.Refresh(context.Background()); err != nil || changed || len(events) != 0 {
+		t.Fatalf("unchanged zones: changed=%v err=%v events=%d", changed, err, len(events))
+	}
+
+	h.whoami.Zones = []string{"edge.example.", "prod.internal.example."}
+	changed, err := w.Refresh(context.Background())
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if got := strings.Join(r.Zones.Get(), ","); got != "edge.example.,prod.internal.example." {
+		t.Fatalf("zones: %s", got)
+	}
+	close(events)
+	var queued []string
+	for e := range events {
+		queued = append(queued, e.Object.GetName())
+	}
+	sort.Strings(queued)
+	if strings.Join(queued, ",") != "a,b" {
+		t.Fatalf("queued: %v (only opted-in Ingresses)", queued)
+	}
+}
+
+func TestRejectedRefreshesZones(t *testing.T) {
+	r, h, rec := setup(t, ingress("web", true, []string{"web.prod.internal.example"}, "10.0.0.1"))
+	h.reject = true
+	refreshed, changed := 0, false
+	r.RefreshZones = func(context.Context) (bool, error) { refreshed++; return changed, nil }
+
+	// Zones unchanged: the rejection is real and reported.
+	reconcile(t, r, "web")
+	if refreshed != 1 || !strings.Contains(strings.Join(drain(rec), "\n"), ReasonRejected) {
+		t.Fatalf("refreshed=%d", refreshed)
+	}
+	// Zones changed under us: no event, the watcher requeues everything.
+	changed = true
+	reconcile(t, r, "web")
+	if refreshed != 2 || len(drain(rec)) != 0 {
+		t.Fatalf("refreshed=%d, expected no event after a zone change", refreshed)
 	}
 }

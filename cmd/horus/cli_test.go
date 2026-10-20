@@ -53,3 +53,15 @@ func TestAbbrev(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestListFlag(t *testing.T) {
+	var l listFlag
+	for _, v := range []string{"a.example", "b.example, c.example", " ,"} {
+		if err := l.Set(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual([]string(l), []string{"a.example", "b.example", "c.example"}) {
+		t.Fatalf("got %q", l)
+	}
+}
