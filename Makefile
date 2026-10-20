@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 BIN     := bin
 
-.PHONY: all tidy build test vet operator operator-test operator-image install clean
+.PHONY: all tidy build test vet operator operator-test operator-image e2e install clean
 
 all: vet test build operator
 
@@ -28,6 +28,11 @@ operator-test:
 
 operator-image:
 	docker build -f operator/Dockerfile --build-arg VERSION=$(VERSION) -t horus-operator:$(VERSION) .
+
+# End-to-end test against a throwaway kind cluster (needs docker, kind,
+# kubectl, dig, openssl). KEEP=1 leaves everything running.
+e2e:
+	test/e2e/kind.sh
 
 # Installs the server on this machine (run as root). Creates the admin token
 # only if it does not exist yet.
