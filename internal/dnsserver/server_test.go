@@ -12,8 +12,9 @@ import (
 	"github.com/Warewave-Technology/horus/pkg/api"
 )
 
-// fakeUpstream answers A queries for ext.example.com. and lb.cloud.example.com.
-// and NXDOMAIN (with SOA) for everything else. It counts queries.
+// fakeUpstream answers A queries for ext.example.com., lb.cloud.example.com.
+// and pub.prod.internal.example. (a public name inside our zone), and NXDOMAIN
+// (with an SOA whose TTL is 600) for everything else. It counts queries.
 func fakeUpstream(t *testing.T) (addr string, queries *atomic.Int32) {
 	t.Helper()
 	queries = &atomic.Int32{}
@@ -23,7 +24,7 @@ func fakeUpstream(t *testing.T) (addr string, queries *atomic.Int32) {
 		m.SetReply(r)
 		q := r.Question[0]
 		switch q.Name {
-		case "ext.example.com.", "lb.cloud.example.com.":
+		case "ext.example.com.", "lb.cloud.example.com.", "pub.prod.internal.example.":
 			m.Answer = append(m.Answer, &dns.A{
 				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
 				A:   net.ParseIP("192.0.2.10").To4(),
@@ -31,8 +32,8 @@ func fakeUpstream(t *testing.T) (addr string, queries *atomic.Int32) {
 		default:
 			m.Rcode = dns.RcodeNameError
 			m.Ns = append(m.Ns, &dns.SOA{
-				Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 60},
-				Ns:  "ns.example.com.", Mbox: "h.example.com.", Serial: 1, Minttl: 30,
+				Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 600},
+				Ns:  "ns.example.com.", Mbox: "h.example.com.", Serial: 1, Minttl: 900,
 			})
 		}
 		w.WriteMsg(m)
@@ -55,6 +56,7 @@ func startHorus(t *testing.T, upstream string) string {
 			{Zone: "prod.internal.example.", Name: "ext.prod.internal.example.", Type: api.TypeCNAME, Data: "lb.cloud.example.com."},
 			{Zone: "prod.internal.example.", Name: "www.prod.internal.example.", Type: api.TypeCNAME, Data: "app.prod.internal.example."},
 			{Zone: "prod.internal.example.", Name: "gone.prod.internal.example.", Type: api.TypeCNAME, Data: "nope.example.com."},
+			{Zone: "prod.internal.example.", Name: "topub.prod.internal.example.", Type: api.TypeCNAME, Data: "pub.prod.internal.example."},
 		},
 	))
 	fwd := NewForwarder(ForwarderOptions{
@@ -84,7 +86,7 @@ func query(t *testing.T, addr, name string, qtype uint16) *dns.Msg {
 }
 
 func TestAuthoritative(t *testing.T) {
-	up, _ := fakeUpstream(t)
+	up, n := fakeUpstream(t)
 	addr := startHorus(t, up)
 
 	r := query(t, addr, "app.prod.internal.example.", dns.TypeA)
@@ -95,17 +97,13 @@ func TestAuthoritative(t *testing.T) {
 		t.Fatalf("answer %v", a)
 	}
 
-	r = query(t, addr, "missing.prod.internal.example.", dns.TypeA)
-	if r.Rcode != dns.RcodeNameError || len(r.Ns) != 1 {
-		t.Fatalf("nxdomain: %v", r)
+	// A name we hold but without that type: NODATA with our SOA, no upstream.
+	r = query(t, addr, "app.prod.internal.example.", dns.TypeAAAA)
+	if !r.Authoritative || r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0 || len(r.Ns) != 1 {
+		t.Fatalf("nodata: %v", r)
 	}
 	if soa := r.Ns[0].(*dns.SOA); soa.Serial != 7 || soa.Minttl != negativeTTLCap {
 		t.Fatalf("soa: %v", soa)
-	}
-
-	r = query(t, addr, "app.prod.internal.example.", dns.TypeAAAA)
-	if r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0 || len(r.Ns) != 1 {
-		t.Fatalf("nodata: %v", r)
 	}
 
 	// NODATA at the end of an in-zone CNAME chain still carries the SOA.
@@ -115,6 +113,46 @@ func TestAuthoritative(t *testing.T) {
 	}
 	if _, ok := r.Ns[0].(*dns.SOA); !ok {
 		t.Fatalf("cname nodata authority: %v", r.Ns)
+	}
+	if got := n.Load(); got != 0 {
+		t.Fatalf("names we hold must never be forwarded, upstream saw %d queries", got)
+	}
+}
+
+func TestUnknownNamesInOurZonesAreForwarded(t *testing.T) {
+	up, n := fakeUpstream(t)
+	addr := startHorus(t, up)
+
+	// A public name inside our zone.
+	r := query(t, addr, "pub.prod.internal.example.", dns.TypeA)
+	if r.Authoritative || r.Rcode != dns.RcodeSuccess || len(r.Answer) != 1 {
+		t.Fatalf("public name in our zone: %v", r)
+	}
+	if a := r.Answer[0].(*dns.A); a.A.String() != "192.0.2.10" {
+		t.Fatalf("answer %v", a)
+	}
+
+	// A name nobody has: upstream's NXDOMAIN, with the SOA TTL capped so a
+	// name registered later becomes visible within negativeTTLCap.
+	for i := 0; i < 2; i++ { // second answer comes from the cache
+		r = query(t, addr, "missing.prod.internal.example.", dns.TypeA)
+		if r.Rcode != dns.RcodeNameError || len(r.Ns) != 1 {
+			t.Fatalf("nxdomain: %v", r)
+		}
+		if soa := r.Ns[0].(*dns.SOA); soa.Hdr.Ttl > negativeTTLCap || soa.Minttl != 900 {
+			t.Fatalf("negative TTL must be capped via the SOA TTL only: %v", soa)
+		}
+	}
+	// The zone apex has no records here: forwarded too.
+	query(t, addr, "prod.internal.example.", dns.TypeSOA)
+	if got := n.Load(); got != 3 {
+		t.Fatalf("expected 3 upstream queries, got %d", got)
+	}
+
+	// Outside our zones the upstream TTLs are left alone.
+	r = query(t, addr, "nope.example.com.", dns.TypeA)
+	if soa := r.Ns[0].(*dns.SOA); soa.Hdr.Ttl != 600 {
+		t.Fatalf("SOA TTL outside our zones must not be touched: %v", soa)
 	}
 }
 
@@ -129,10 +167,20 @@ func TestCNAMEChaseUpstream(t *testing.T) {
 		t.Fatalf("first answer must be the CNAME: %v", r.Answer)
 	}
 
-	// The upstream target does not exist: NXDOMAIN with the upstream SOA.
+	// The upstream target does not exist: NXDOMAIN with the upstream SOA,
+	// TTL capped (the negative answer is cached for our name).
 	r = query(t, addr, "gone.prod.internal.example.", dns.TypeA)
 	if r.Rcode != dns.RcodeNameError || len(r.Answer) != 1 || len(r.Ns) != 1 {
 		t.Fatalf("expected CNAME + NXDOMAIN with SOA, got %v", r)
+	}
+	if soa := r.Ns[0].(*dns.SOA); soa.Hdr.Ttl > negativeTTLCap {
+		t.Fatalf("SOA TTL not capped: %v", soa)
+	}
+
+	// A CNAME to a name in our zone that we do not hold: chased upstream.
+	r = query(t, addr, "topub.prod.internal.example.", dns.TypeA)
+	if len(r.Answer) != 2 || r.Answer[1].(*dns.A).A.String() != "192.0.2.10" {
+		t.Fatalf("expected CNAME + public A, got %v", r.Answer)
 	}
 }
 

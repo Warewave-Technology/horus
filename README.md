@@ -2,8 +2,10 @@
 
 A small internal DNS server with a Kubernetes operator.
 
-horus is authoritative for a few internal zones and forwards every other
-query to upstream resolvers through a TTL-aware cache. Data lives in SQLite.
+horus answers the names it holds records for, inside a few zones, and
+forwards every other query to upstream resolvers through a TTL-aware cache.
+That includes names inside those zones that horus does not hold, so a zone
+can mix internal and public names. Data lives in SQLite.
 You manage it with a REST API and a CLI, and it runs under systemd as one
 static binary. In each Kubernetes cluster, an operator registers the hosts of
 annotated Ingresses, so `web.prod.internal.example` resolves to the Ingress
@@ -43,11 +45,14 @@ simplicity.
 
 ## Features
 
-- **Authoritative zones**: A, AAAA and CNAME records. CNAMEs are followed
-  inside our own zones. A CNAME that points outside them is resolved upstream
+- **Name overrides inside zones**: A, AAAA and CNAME records. horus answers
+  the names it holds and forwards every other name, even inside its zones,
+  so public records of the same domain keep working. CNAMEs are followed
+  through names horus holds. A CNAME to any other name is resolved upstream
   and the result is appended, so stub resolvers get a complete answer.
-- **Correct negative answers**: NXDOMAIN and NODATA carry a synthesized SOA.
-  The negative TTL is capped at 30 seconds, so a name that was just
+- **Short negative caching**: names in our zones are never negatively cached
+  by clients for more than 30 seconds. horus caps its own SOA and the SOA TTL
+  of upstream negative answers for those names. A name that was just
   registered resolves quickly even for clients that cached its NXDOMAIN.
 - **Forwarding**: an ordered list of upstreams with failover and
   "sticky last good" selection. Queries go over UDP first and retry over TCP
@@ -109,7 +114,8 @@ These are deliberate decisions (see the "Decisions" table in
 ```
 
 - **Read path**: `dnsserver.Handler` asks the current `zone.Snapshot`. If
-  the name is outside every zone, the query is forwarded. Otherwise the
+  horus holds no record for the name (outside every zone, or a name inside a
+  zone that horus does not hold), the query is forwarded. Otherwise the
   snapshot answers on its own. It never touches SQLite and never takes a lock.
 - **Write path**: every API write takes a mutex, runs one SQLite transaction
   (which also bumps the zone serial and appends to `audit_log`), then
@@ -377,35 +383,49 @@ All responses set `RA`. The client's question section is echoed with its
 original casing (0x20 randomization works). Owner names in answers are
 lowercase.
 
-### Authoritative answers
+### Which names horus answers
 
-For a name inside one of our zones:
+horus **overrides names, it does not own zones**. A zone says where horus may
+hold names. Any name horus holds no record for is forwarded upstream, even
+inside the zone. You can therefore make `example.com` a zone, add
+`internal.example.com`, and `www.example.com` still resolves from public DNS.
+
+| Query | Response |
+|---|---|
+| Name outside every zone | forwarded |
+| Name inside a zone, horus holds no record for it (unknown name, empty non-terminal, zone apex without records) | forwarded; for NXDOMAIN/NODATA the SOA TTL is capped at 30s (see below) |
+| Name horus holds, matching type | the records, `AA` set |
+| Name horus holds, other type (for example only A, query AAAA) | NODATA with horus's SOA, `AA` set, **not** forwarded |
+| Name horus holds with a CNAME | the CNAME, followed (see below) |
+
+Why a held name is never partly forwarded: if horus holds an internal A for a
+name and the public zone has an AAAA (or a CNAME) for it, merging the two
+would send IPv6-preferring clients to the public endpoint. A name horus holds
+is answered by horus alone. Add the AAAA to horus too if you need it.
+
+Details:
 
 1. **Exact match** of the query type → the records (`NOERROR`). Several A or
    AAAA records for a name are all returned. `ANY` returns every record of
    the name.
-2. **The name has a CNAME** (and the query is not for CNAME) → the CNAME is
-   returned and followed:
-   - into one of our zones: the target's records are appended. Chains are
-     followed for at most 8 CNAMEs. A loop (`a → b → a`) stops after
-     returning each CNAME once.
-   - outside our zones: the target is resolved upstream (through the cache)
-     and its answer appended. If upstream says NXDOMAIN, the response is
-     NXDOMAIN. Negative upstream answers pass the upstream SOA through. If
-     upstream fails, the client still gets the CNAME and can chase it itself.
-3. **The name exists but has no data of that type**, or it is an *empty
-   non-terminal* (`b.zone` when only `a.b.zone` exists) → `NOERROR` with no
-   answer (NODATA) and the SOA in the authority section.
-4. **The name does not exist** → `NXDOMAIN` with the SOA. A dangling in-zone
-   CNAME also ends in NXDOMAIN (RFC 6604: the rcode describes the last name
-   in the chain), and the CNAME is kept in the answer.
-5. **SOA query at the zone apex** → the synthesized SOA. NS queries at the
-   apex get NODATA (horus serves no NS records).
-
-Negative answers carry the SOA of the zone that holds the **last** name of
-the chain.
+2. **CNAME** (and the query is not for CNAME) → the CNAME is returned and
+   followed:
+   - to a name horus holds (in any of its zones): the target's records are
+     appended. Chains are followed for at most 8 CNAMEs. A loop
+     (`a → b → a`) stops after returning each CNAME once.
+   - to any other name (outside our zones, or inside them but not held): the
+     target is resolved upstream (through the cache) and its answer appended.
+     If upstream says NXDOMAIN, the response is NXDOMAIN, with the upstream
+     SOA (TTL capped). If upstream fails, the client still gets the CNAME and
+     can chase it itself.
+3. **NODATA** answers carry the synthesized SOA of the zone that holds the
+   last name of the chain.
+4. **SOA and NS queries** are forwarded unless the apex is a name horus
+   holds, in which case they get NODATA (horus serves no NS records).
 
 ### Synthesized SOA
+
+Used in horus's own NODATA answers:
 
 | Field | Value |
 |---|---|
@@ -415,9 +435,25 @@ the chain.
 | REFRESH / RETRY / EXPIRE | 3600 / 600 / 86400 (informational; there are no secondaries) |
 | MINIMUM | `min(zone default TTL, 30)` |
 
-Clients cache negative answers for at most `min(SOA TTL, MINIMUM)`, which
-is 30 seconds or less. That is how long a client might keep seeing NXDOMAIN
-for a name that was just registered.
+### Negative caching of names in our zones
+
+Clients cache a negative answer for `min(SOA TTL, SOA MINIMUM)` (RFC 2308).
+For every name inside one of our zones, horus keeps that at 30 seconds or
+less:
+
+- its own NODATA answers use MINIMUM ≤ 30;
+- upstream NXDOMAIN/NODATA answers for names in our zones (forwarded, or at
+  the end of a chased CNAME) get their SOA **TTL** lowered to 30. The SOA
+  data itself is not changed.
+
+That is the longest a client keeps seeing NXDOMAIN for a name that was just
+registered (by the operator or with `horus record add`). horus's own
+forwarding cache does not delay it either: names horus holds are always
+answered from the snapshot first.
+
+Positive public answers are not capped. If a name already resolves publicly
+and you then add it to horus, clients that cached the public answer keep it
+until its TTL runs out.
 
 ### EDNS and truncation
 
@@ -451,7 +487,9 @@ for a name that was just registered.
 - Concurrent identical misses share one upstream exchange.
 - Expired entries are swept every minute. `systemctl reload horus` (SIGHUP)
   flushes the whole cache.
-- Our own zones are never cached. They are answered from the snapshot.
+- Names horus holds are never cached. They are answered from the snapshot,
+  which is checked before the cache. Other names inside our zones are
+  forwarded and cached like any other name.
 
 ## Records, zones and ownership
 
@@ -884,7 +922,7 @@ collection and reconciles start failing with `401`.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `horus_dns_queries_total` | counter | `result` | DNS queries by outcome: `authoritative`, `nxdomain`, `nodata`, `forwarded`, `cache_hit`, `servfail`, `refused`, `formerr`, `notimp`, `badvers` |
+| `horus_dns_queries_total` | counter | `result` | DNS queries by outcome: `authoritative` (answered by horus, including chased CNAMEs), `nodata` (a name horus holds, other type), `forwarded`, `cache_hit` (forwarded, answered from the cache; includes names in our zones that horus does not hold), `servfail`, `refused`, `formerr`, `notimp`, `badvers` |
 | `horus_upstream_errors_total` | counter | `upstream` | Failed upstream exchanges (timeouts, network errors, SERVFAIL/REFUSED answers) |
 | `horus_cache_entries` | gauge | | Entries in the forwarding cache |
 | `horus_zones` | gauge | | Zones in the served snapshot |
@@ -924,6 +962,12 @@ Schema migrations run automatically at start (tracked with
 and an older binary cannot open a migrated database. To go back, restore the
 backup taken before the upgrade.
 
+- **v0.2 → v0.3**: names inside a zone that horus does not hold are now
+  forwarded upstream instead of answered with NXDOMAIN (no schema change).
+  Zones no longer hide public names of the same domain, so broad zones such
+  as `example.com` are safe. Internal names that do not exist now get the
+  upstream's NXDOMAIN (TTL capped at 30s), and they SERVFAIL if no upstream
+  answers.
 - **v0.1 → v0.2**: clusters can own several zones (schema version 2).
   Existing clusters keep their zone and token. Upgrade the server first, then
   the operators (see [operator compatibility](#operator-flags)).
@@ -938,7 +982,9 @@ backup taken before the upgrade.
 | CLI: `dial unix /run/horus/api.sock: ... permission denied` | Run as root. |
 | CLI: `connect: no such file or directory` | horus is not running, or `HORUS_API_SOCKET` differs from `--addr`. |
 | Name resolves to the old address for a while | Positive TTL (record TTL or zone default). Lower the TTL with the `ttl` annotation. |
-| New name gives NXDOMAIN for up to 30s | The client cached the earlier NXDOMAIN. This is expected (SOA MINIMUM ≤ 30s). |
+| New name gives NXDOMAIN for up to 30s | The client cached the earlier NXDOMAIN. This is expected: negative answers for names in our zones are capped at 30s. |
+| A public name in one of our zones gets NODATA from horus | horus holds that name (for some other type). A held name is answered by horus alone; add the missing record to horus, or remove horus's record for that name. |
+| Names in our zones SERVFAIL | horus does not hold them, so they are forwarded, and every upstream failed. Names horus holds keep working without upstreams. |
 | Ingress not registered | `kubectl describe ingress`: look for events. No events at all → missing `register: "true"` annotation, or the operator is not running. `waiting for a load balancer address` in operator logs → the ingress controller has not published `status.loadBalancer`. Use the `target` annotation if it never will. |
 | `HostnameConflict` | `horus owners` shows who holds the name. Remove that record or Ingress. The operator picks the name up within 5 minutes. |
 | `HostSkipped: ... outside the cluster's zones` | The host's zone is not assigned to this cluster: `horus cluster zone add <cluster> <zone>` (create the zone first if needed). It is picked up within a minute. |

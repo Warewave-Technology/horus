@@ -19,34 +19,30 @@ import (
 // Loops (a -> b -> a) are detected separately and stop earlier.
 const maxCNAMEChain = 8
 
-// Rcode is the subset of DNS response codes the snapshot can decide on its own.
-type Rcode int
-
-const (
-	NoError Rcode = iota
-	NXDomain
-)
-
 // Result is the outcome of a lookup.
+//
+// horus overrides names, it does not own whole zones: a name it holds records
+// for is answered from the snapshot; any other name, even inside one of our
+// zones, is resolved upstream (Forward). Zones may therefore contain public
+// names that horus never heard of.
 type Result struct {
-	// Authoritative is false when the name is not inside any of our zones;
-	// the caller should forward the query upstream.
-	Authoritative bool
-	Rcode         Rcode
-	// Zone is the zone of the last in-zone name in the chain (for building the
-	// SOA of a negative answer). Set when Authoritative.
+	// Forward is true when horus holds no record for qname: the caller
+	// resolves the query upstream.
+	Forward bool
+	// Zone is our zone containing qname, or nil if qname is outside every
+	// zone. For answers it is the zone of the last name in the CNAME chain
+	// (for the SOA of a NODATA answer).
 	Zone *api.Zone
 	// Answer holds the records to return, in order (CNAME chain first).
 	// TTLs are already resolved (record TTL or zone default).
 	Answer []api.Record
-	// ChaseTarget is set when the last CNAME in Answer points outside our zones.
-	// The caller should resolve ChaseTarget upstream and append the result.
+	// ChaseTarget is set when the last CNAME in Answer points to a name we
+	// hold no record for (outside our zones, or inside them but not ours).
+	// The caller resolves ChaseTarget upstream and appends the result.
 	ChaseTarget string
-	// SOA is true when the answer for qtype SOA at the apex should be synthesized.
-	SOA bool
-	// NoData is true when the last name in the chain exists (or is an empty
-	// non-terminal) but has no data of qtype. With NXDomain it marks the
-	// negative answers that carry the SOA of Zone in the authority section.
+	// NoData is true when the last name in the chain is one we hold but it
+	// has no data of qtype. The answer carries the SOA of Zone; the query is
+	// not forwarded, so internal and public data never mix for one name.
 	NoData bool
 }
 
@@ -57,11 +53,8 @@ type node struct {
 
 // Snapshot is an immutable index of zones and records.
 type Snapshot struct {
-	zones map[string]*api.Zone // by name
-	names map[string]*node     // by owner name
-	// ents holds empty non-terminals: names that have no records themselves
-	// but have descendants that do (they must answer NODATA, not NXDOMAIN).
-	ents     map[string]bool
+	zones    map[string]*api.Zone // by name
+	names    map[string]*node     // by owner name
 	nRecords int
 }
 
@@ -70,7 +63,6 @@ func Build(zones []api.Zone, records []api.Record) *Snapshot {
 	s := &Snapshot{
 		zones: make(map[string]*api.Zone, len(zones)),
 		names: make(map[string]*node, len(records)),
-		ents:  map[string]bool{},
 	}
 	for i := range zones {
 		z := zones[i]
@@ -91,10 +83,6 @@ func Build(zones []api.Zone, records []api.Record) *Snapshot {
 		}
 		n.records = append(n.records, r)
 		s.nRecords++
-		// Mark every ancestor between the name and its zone apex as an ENT.
-		for p := parent(r.Name); p != "" && p != z.Name && api.InZone(p, z.Name); p = parent(p) {
-			s.ents[p] = true
-		}
 	}
 	return s
 }
@@ -115,37 +103,21 @@ func (s *Snapshot) FindZone(name string) *api.Zone {
 	return nil
 }
 
-// Lookup resolves qname/qtype against authoritative data. qname may be in any
-// case and with or without the trailing dot.
+// Lookup resolves qname/qtype against the snapshot. qname may be in any case
+// and with or without the trailing dot.
 func (s *Snapshot) Lookup(qname string, qtype uint16) Result {
 	qname = api.NormalizeName(qname)
 	z := s.FindZone(qname)
-	if z == nil {
-		return Result{}
+	n := s.names[qname]
+	if n == nil {
+		// Not ours (possibly a public name inside one of our zones).
+		return Result{Forward: true, Zone: z}
 	}
-	res := Result{Authoritative: true, Zone: z}
+	res := Result{Zone: z}
 	name := qname
 	visited := map[string]bool{}
 	for {
 		visited[name] = true
-		n := s.names[name]
-		if n == nil {
-			if name == z.Name || s.ents[name] {
-				// Apex with no records, or an empty non-terminal.
-				if name == qname && qtype == api.QTypeSOA && name == z.Name {
-					res.SOA = true
-				} else {
-					res.NoData = true
-				}
-				return res
-			}
-			// Either qname itself does not exist, or an in-zone CNAME target
-			// is dangling. Per RFC 6604 the rcode reflects the last name in
-			// the chain, so both cases are NXDOMAIN (with any CNAMEs kept).
-			res.Rcode = NXDomain
-			return res
-		}
-
 		var cname *api.Record
 		matched := false
 		for i := range n.records {
@@ -159,21 +131,15 @@ func (s *Snapshot) Lookup(qname string, qtype uint16) Result {
 			}
 		}
 		if matched || cname == nil || qtype == api.QTypeCNAME {
-			if !matched {
-				if name == qname && qtype == api.QTypeSOA && name == z.Name {
-					res.SOA = true
-				} else {
-					res.NoData = true
-				}
-			}
+			res.NoData = !matched
 			return res
 		}
 
 		// Follow the CNAME.
 		res.Answer = append(res.Answer, *cname)
 		target := cname.Data
-		tz := s.FindZone(target)
-		if tz == nil {
+		next := s.names[target]
+		if next == nil {
 			res.ChaseTarget = target
 			return res
 		}
@@ -182,9 +148,8 @@ func (s *Snapshot) Lookup(qname string, qtype uint16) Result {
 			// the client's resolver give up on it.
 			return res
 		}
-		name = target
-		z = tz
-		res.Zone = tz
+		name, n = target, next
+		res.Zone = next.zone
 	}
 }
 

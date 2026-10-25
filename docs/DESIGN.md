@@ -1,8 +1,9 @@
 # horus — design
 
-horus is a small internal DNS server. It is authoritative for a handful of
-internal zones, forwards everything else to upstream resolvers, stores its data
-in SQLite, is managed through a REST API and a CLI, and runs under systemd.
+horus is a small internal DNS server. It answers the names it holds records
+for (inside a handful of zones), forwards everything else to upstream
+resolvers (including other names in those zones), stores its data in SQLite,
+is managed through a REST API and a CLI, and runs under systemd.
 A Kubernetes operator (one per cluster) registers annotated Ingresses.
 
 Scale target: ~20 human users, a few clusters, hundreds (not millions) of
@@ -46,17 +47,22 @@ records. Simplicity beats throughput everywhere below.
 
 1. `Handler.ServeDNS` rejects non-QUERY opcodes, multi-question messages,
    non-IN classes, and EDNS versions other than 0.
-2. `Snapshot.Lookup(qname, qtype)` decides:
-   - not inside any zone → forward;
-   - name exists with matching type → answer;
-   - name has a CNAME → follow it inside our zones (max 8 hops, loop-safe);
-     if the target is outside our zones, the handler resolves the target
-     upstream and appends it (`ChaseTarget`);
-   - name exists but not that type, or is an empty non-terminal → NODATA;
-   - otherwise → NXDOMAIN.
-   Negative answers carry a synthesized SOA in the authority section.
-3. The SOA's MINIMUM is `min(zone default TTL, 30s)`, so a client that cached
-   an NXDOMAIN sees a freshly registered Ingress within 30 seconds.
+2. `Snapshot.Lookup(qname, qtype)` decides. horus **overrides names, it does
+   not own zones**: zones may also contain public names horus never heard of.
+   - horus holds no record for the name (outside every zone, or inside one:
+     unknown names, empty non-terminals, an apex without records) → forward;
+   - name held with matching type → answer;
+   - name held with a CNAME → follow it through names we hold (max 8 CNAMEs,
+     loop-safe); when the target is a name we do not hold (outside our zones
+     or not), the handler resolves it upstream and appends it (`ChaseTarget`);
+   - name held but not that type → NODATA with a synthesized SOA. It is *not*
+     forwarded: mixing an internal A with a public AAAA (or CNAME) for one
+     name would send clients to the public endpoint.
+3. Negative TTLs are capped at 30s for names in our zones: the synthesized
+   SOA's MINIMUM is `min(zone default TTL, 30s)`, and the SOA TTL of upstream
+   negative answers for names in our zones (forwarded, or ending a chased
+   CNAME) is lowered to 30s. A client that cached an NXDOMAIN sees a freshly
+   registered Ingress within 30 seconds.
 4. EDNS0: we advertise 1232 bytes; UDP responses are truncated to the client's
    advertised size (min 512, max 1232).
 

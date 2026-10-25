@@ -80,7 +80,10 @@ wait_for() {
 }
 
 answer_is() { [[ $(resolve "$1" "$2" | sort | tr '\n' ' ') == "$3 " ]]; }
-nxdomain() { dig @127.0.0.1 -p "$DNS_PORT" +tries=1 +time=2 "$1" A | grep -q 'status: NXDOMAIN'; }
+# gone NAME: horus has no A record for NAME. Names horus does not hold are
+# forwarded upstream (NXDOMAIN there, or SERVFAIL without internet), so check
+# for an empty answer rather than a specific rcode.
+gone() { [[ -z $(resolve "$1" A) ]]; }
 has_event() { kubectl get events -n default --field-selector "reason=$1" -o name | grep -q .; }
 
 log "build"
@@ -200,11 +203,11 @@ answer_is "taken.$ZONE" A 10.99.9.9 || fail "manual record was overwritten"
 
 log "5. removing the annotation removes the records"
 kubectl annotate ingress mixed horus.warewave.tech/register- >/dev/null
-wait_for "free.$ZONE gone" nxdomain "free.$ZONE"
+wait_for "free.$ZONE gone" gone "free.$ZONE"
 
 log "6. deleting the Ingress removes the records"
 kubectl delete ingress lb >/dev/null
-wait_for "lb.$ZONE gone" nxdomain "lb.$ZONE"
+wait_for "lb.$ZONE gone" gone "lb.$ZONE"
 
 log "7. garbage collection catches deletes made while the operator was down"
 kubectl -n horus-system scale deploy/horus-operator --replicas=0 >/dev/null
@@ -212,28 +215,37 @@ kubectl -n horus-system wait --for=delete pod -l app.kubernetes.io/name=horus-op
 kubectl delete ingress web >/dev/null
 answer_is "web.$ZONE" A 10.99.0.11 || fail "web.$ZONE should still resolve while the operator is down"
 kubectl -n horus-system scale deploy/horus-operator --replicas=1 >/dev/null
-wait_for "web.$ZONE gone after restart" nxdomain "web.$ZONE"
+wait_for "web.$ZONE gone after restart" gone "web.$ZONE"
 
 log "8. a second zone added to the cluster at runtime is picked up without a restart"
 ingress multi "a.$ZONE" '    horus.warewave.tech/hostnames: "a.'"$ZONE"',a.'"$ZONE2"'"'
 lb_ip multi 10.99.0.30
 wait_for "a.$ZONE A 10.99.0.30" answer_is "a.$ZONE" A 10.99.0.30
 wait_for "HostSkipped event for a.$ZONE2" has_event HostSkipped
-nxdomain "a.$ZONE2" || fail "a.$ZONE2 must not resolve before $ZONE2 is assigned"
+gone "a.$ZONE2" || fail "a.$ZONE2 must not resolve before $ZONE2 is assigned"
 cli cluster zone add kind "$ZONE2"
 wait_for "a.$ZONE2 A 10.99.0.30" answer_is "a.$ZONE2" A 10.99.0.30
 cli --json whoami >/dev/null
 
 log "9. removing that zone deletes the cluster's records in it, the rest stays"
 cli cluster zone rm kind "$ZONE2"
-wait_for "a.$ZONE2 gone" nxdomain "a.$ZONE2"
+wait_for "a.$ZONE2 gone" gone "a.$ZONE2"
 answer_is "a.$ZONE" A 10.99.0.30 || fail "a.$ZONE must survive the removal of $ZONE2"
 sleep 7 # one zone refresh: the operator must not re-add the name
-nxdomain "a.$ZONE2" || fail "a.$ZONE2 came back after the zone was removed"
+gone "a.$ZONE2" || fail "a.$ZONE2 came back after the zone was removed"
 
-log "10. forwarding still works next to the authoritative zones"
+log "10. names horus does not hold are forwarded, also inside a zone of ours"
 cli owners
 dig @127.0.0.1 -p "$DNS_PORT" +tries=1 +time=3 example.com A | grep -q 'status: NOERROR' ||
 	echo "warning: forwarding check failed (no internet access?)"
+cli zone add example.com >/dev/null
+cli record add "internal.example.com" A 10.99.0.40 >/dev/null
+answer_is internal.example.com A 10.99.0.40 || fail "internal.example.com must come from horus"
+if dig @127.0.0.1 -p "$DNS_PORT" +tries=1 +time=3 www.example.com A | grep -q 'status: NOERROR'; then
+	[[ -n $(resolve www.example.com A) ]] || fail "www.example.com (public, inside our zone example.com) must be forwarded"
+	echo "ok: public name inside our zone forwarded"
+else
+	echo "warning: skipped the public-name check (no internet access?)"
+fi
 
 printf '\nPASS: e2e\n'

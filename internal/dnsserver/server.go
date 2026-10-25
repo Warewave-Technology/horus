@@ -1,5 +1,6 @@
-// Package dnsserver is the DNS front end: it answers from the in-memory zone
-// snapshot when authoritative and forwards everything else upstream.
+// Package dnsserver is the DNS front end: it answers names horus holds from the
+// in-memory zone snapshot and forwards everything else upstream, including
+// names inside our zones that horus has no records for.
 package dnsserver
 
 import (
@@ -20,9 +21,11 @@ import (
 // (DNS Flag Day 2020 recommendation, avoids IP fragmentation).
 const ednsSize = 1232
 
-// negativeTTLCap bounds the SOA MINIMUM we hand out for our own zones. It is
-// deliberately short: a freshly registered Ingress should become resolvable
-// quickly for clients that already cached its NXDOMAIN.
+// negativeTTLCap bounds negative caching for names in our zones: the SOA
+// MINIMUM of our own NODATA answers, and the SOA TTL of upstream negative
+// answers for names inside our zones. It is deliberately short: a freshly
+// registered Ingress should become resolvable quickly for clients that
+// already cached its NXDOMAIN.
 const negativeTTLCap = 30
 
 // Options configures the Handler.
@@ -95,8 +98,13 @@ func (h *Handler) answer(r *dns.Msg) (*dns.Msg, string) {
 	}
 
 	res := h.opt.Snapshots.Load().Lookup(q.Name, q.Qtype)
-	if !res.Authoritative {
-		return h.forward(r, q)
+	if res.Forward {
+		m, result := h.forward(r, q)
+		if res.Zone != nil {
+			// A name inside our zones that we do not hold (yet).
+			capNegativeTTL(m)
+		}
+		return m, result
 	}
 
 	m := new(dns.Msg)
@@ -108,13 +116,10 @@ func (h *Handler) answer(r *dns.Msg) (*dns.Msg, string) {
 			m.Answer = append(m.Answer, rr)
 		}
 	}
-	if res.SOA {
-		m.Answer = append(m.Answer, h.soa(res.Zone))
-	}
 	if res.ChaseTarget != "" {
-		// Our CNAME points outside our zones: complete the chain upstream so
-		// stub resolvers get a usable answer. On failure the client still
-		// gets the CNAME and may chase it itself.
+		// Our CNAME points to a name we do not hold: complete the chain
+		// upstream so stub resolvers get a usable answer. On failure the
+		// client still gets the CNAME and may chase it itself.
 		up, _, err := h.opt.Forwarder.Resolve(dns.Question{Name: res.ChaseTarget, Qtype: q.Qtype, Qclass: dns.ClassINET})
 		if err == nil {
 			m.Answer = append(m.Answer, up.Answer...)
@@ -122,22 +127,31 @@ func (h *Handler) answer(r *dns.Msg) (*dns.Msg, string) {
 				m.Rcode = dns.RcodeNameError
 			}
 			if up.Rcode == dns.RcodeNameError || len(up.Answer) == 0 {
-				// Negative upstream answer: pass its SOA on for negative caching.
+				// Negative upstream answer: pass its SOA on for negative
+				// caching, capped because clients cache it for our name.
 				m.Ns = append(m.Ns, up.Ns...)
+				capNegativeTTL(m)
 			}
 		}
 		return m, "authoritative"
 	}
-	switch {
-	case res.Rcode == zone.NXDomain:
-		m.Rcode = dns.RcodeNameError
-		m.Ns = append(m.Ns, h.soa(res.Zone))
-		return m, "nxdomain"
-	case res.NoData:
+	if res.NoData {
 		m.Ns = append(m.Ns, h.soa(res.Zone))
 		return m, "nodata"
 	}
 	return m, "authoritative"
+}
+
+// capNegativeTTL lowers the TTL of SOA records in the authority section to
+// negativeTTLCap. Resolvers cache a negative answer for min(SOA TTL, SOA
+// MINIMUM) (RFC 2308), so this bounds how long a client keeps NXDOMAIN for a
+// name in our zones that gets registered later, without altering the SOA data.
+func capNegativeTTL(m *dns.Msg) {
+	for _, rr := range m.Ns {
+		if soa, ok := rr.(*dns.SOA); ok {
+			soa.Hdr.Ttl = min(soa.Hdr.Ttl, negativeTTLCap)
+		}
+	}
 }
 
 func (h *Handler) forward(r *dns.Msg, q dns.Question) (*dns.Msg, string) {
