@@ -129,6 +129,7 @@ jobs:
                 ghcr.io/warewave-technology/horus-operator:${{ github.ref_name }}
 
             Binaries: static Linux builds below; verify with `sha256sum -c SHA256SUMS`.
-            Installation and upgrade notes: see the [README](https://github.com/${{ github.repository }}#readme).
+            Upgrade steps and version notes: [Upgrading](https://github.com/${{ github.repository }}#upgrading).
+            Installation: see the [README](https://github.com/${{ github.repository }}#installation).
           files: dist/*
           fail_on_unmatched_files: true

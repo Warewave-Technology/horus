@@ -37,6 +37,7 @@ simplicity.
 - [REST API](#rest-api)
 - [Security model](#security-model)
 - [Operations](#operations)
+- [Upgrading](#upgrading)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 - [Repository layout](#repository-layout)
@@ -167,6 +168,8 @@ GOOS=linux GOARCH=amd64 make build
 
 Prebuilt Linux binaries are attached to the
 [GitHub releases](https://github.com/Warewave-Technology/horus/releases).
+To move an existing installation to a newer version, see
+[Upgrading](#upgrading).
 
 ### 2. Install the server (systemd)
 
@@ -730,7 +733,8 @@ Startup fails fast, and Kubernetes restarts the pod, when:
 Compatibility: an operator from v0.2.0 or later also works against an older
 server (it then uses the single `zone` from `whoami`). An older operator
 works against a newer server, but only registers names in the cluster's
-first zone (alphabetical). Upgrade the server first, then the operators.
+first zone (alphabetical). Upgrade the server first, then the operators
+(see [Upgrading](#upgrading)).
 
 ## REST API
 
@@ -950,27 +954,149 @@ journalctl -u horus -o cat | jq .
   failures at `debug`.
 - `HORUS_QUERY_LOG=true` logs every DNS query.
 
-### Upgrading
+## Upgrading
+
+Every release is listed on the
+[releases page](https://github.com/Warewave-Technology/horus/releases), with
+binaries and the operator image. Before you start, read the
+[notes for every version](#version-notes) between yours and the target.
+
+**Order:** back up, upgrade the **server**, check it, then upgrade the
+**operator** in each cluster. Newer servers keep working with older operators,
+and newer operators fall back to older servers (see
+[compatibility](#compatibility)), so the clusters can follow at their own
+pace.
+
+### Which version is running
 
 ```sh
-git pull && make build && make install      # or copy a release binary to /usr/local/bin/horus
-systemctl restart horus
+horus version                                                   # the installed binary
+journalctl -u horus -o cat | grep '"horus started"' | tail -1   # the running server ("version")
+kubectl -n horus-system get deploy horus-operator \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'  # an operator
 ```
 
-Schema migrations run automatically at start (tracked with
-`PRAGMA user_version`). Take a backup first: there is no automatic downgrade,
-and an older binary cannot open a migrated database. To go back, restore the
-backup taken before the upgrade.
+### Server: from a release binary (recommended)
+
+On the horus host. Set `VERSION` to the target release and `ARCH` to `amd64`
+or `arm64` (`uname -m`: `x86_64` → `amd64`, `aarch64` → `arm64`):
+
+```sh
+VERSION=v0.3.0
+ARCH=amd64
+cd "$(mktemp -d)"
+curl -fsSLO "https://github.com/Warewave-Technology/horus/releases/download/$VERSION/horus_${VERSION}_linux_${ARCH}"
+curl -fsSLO "https://github.com/Warewave-Technology/horus/releases/download/$VERSION/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS            # must print: horus_..._linux_...: OK
+
+sudo horus backup                                   # consistent DB copy, prints its path
+sudo cp /usr/local/bin/horus /usr/local/bin/horus.prev   # keep the old binary for a rollback
+sudo install -m 0755 "horus_${VERSION}_linux_${ARCH}" /usr/local/bin/horus
+sudo systemctl restart horus
+```
+
+Then check:
+
+```sh
+systemctl status horus                              # active (running), "serving N zones, M records"
+journalctl -u horus -o cat | grep '"horus started"' | tail -1   # shows the new version
+sudo horus zone ls && sudo horus cluster ls
+dig @127.0.0.1 +short <a name horus holds>
+```
+
+- DNS is unavailable for the second or two the restart takes. Clients retry.
+  The API answers again once systemd reports the service as started
+  (`Type=notify`).
+- Schema migrations run automatically on the first start of the new version
+  (see [version notes](#version-notes)). If the start fails, `journalctl -u
+  horus` says why. [Roll back](#rolling-back) if needed.
+- Config (`/etc/horus/horus.env`), tokens and TLS files are untouched.
+- Unit files change rarely; the version notes say when. To update them, use
+  the source route below or copy them from `deploy/systemd/` of that tag.
+
+### Server: from source
+
+Needs Go 1.26+ on the host (or build elsewhere with
+`GOOS=linux GOARCH=amd64 make build` and copy `bin/horus`):
+
+```sh
+git fetch --tags && git checkout v0.3.0
+make build
+sudo horus backup
+sudo cp /usr/local/bin/horus /usr/local/bin/horus.prev
+sudo make install
+sudo systemctl restart horus
+```
+
+`make install` replaces the binary and the unit files in
+`/etc/systemd/system/` (keep local changes in drop-ins under
+`horus.service.d/`, which it does not touch). It never overwrites
+`/etc/horus/horus.env` or `/etc/horus/admin.token`.
+
+### Operator
+
+In each cluster, after the server:
+
+```sh
+kubectl -n horus-system set image deploy/horus-operator \
+  operator=ghcr.io/warewave-technology/horus-operator:v0.3.0
+kubectl -n horus-system rollout status deploy/horus-operator
+kubectl -n horus-system logs deploy/horus-operator | grep 'connected to horus'   # version, cluster, zones
+```
+
+- No records are lost while the operator restarts. Records live on the
+  server. Ingress changes made meanwhile are applied once the new pod is the
+  leader, and garbage collection runs at its start.
+- If the version notes mention manifest changes (RBAC, flags), apply the
+  manifest of that tag instead, with your `HORUS_URL` and image set:
+  `kubectl apply -f operator/config/operator.yaml`.
+- Keep the manifest you deploy from in sync with the running image, so a later
+  `kubectl apply` does not roll it back.
+
+### Rolling back
+
+- **Same schema version** (see the table below), for example v0.3.0 → v0.2.0:
+  put the old binary back and restart.
+  ```sh
+  sudo install -m 0755 /usr/local/bin/horus.prev /usr/local/bin/horus
+  sudo systemctl restart horus
+  ```
+- **The upgrade migrated the schema**, for example v0.2.0 → v0.1.1: an older
+  binary cannot open the newer database. Restore the backup taken before the
+  upgrade (see [Backups and restore](#backups-and-restore)), then install the
+  old binary and start. Manual changes made after the backup are lost.
+  Operator-owned records come back by themselves, from the operators'
+  reconciles and garbage collection. Roll the operators back first if they
+  are newer than the old server supports (see [compatibility](#compatibility)).
+- **Operator**: `kubectl -n horus-system rollout undo deploy/horus-operator`.
+
+### Version notes
+
+| Version | Schema | Server | Operator | Action needed |
+|---|---|---|---|---|
+| v0.3.0 | 2 | names in our zones that horus does not hold are forwarded upstream instead of NXDOMAIN | unchanged | none; read the behavior change below |
+| v0.2.0 | 2 (migrates from 1) | clusters can own several zones; new `cluster zone add/rm` | follows zone changes; new `--zone-refresh` | upgrade the server before the operators |
+| v0.1.1 | 1 | unchanged | first image on ghcr.io | none |
+| v0.1.0 | 1 | first release | binaries only, no image | none |
 
 - **v0.2 → v0.3**: names inside a zone that horus does not hold are now
   forwarded upstream instead of answered with NXDOMAIN (no schema change).
   Zones no longer hide public names of the same domain, so broad zones such
   as `example.com` are safe. Internal names that do not exist now get the
   upstream's NXDOMAIN (TTL capped at 30s), and they SERVFAIL if no upstream
-  answers.
-- **v0.1 → v0.2**: clusters can own several zones (schema version 2).
-  Existing clusters keep their zone and token. Upgrade the server first, then
-  the operators (see [operator compatibility](#operator-flags)).
+  answers. A name horus holds is still answered by horus alone (see
+  [Which names horus answers](#which-names-horus-answers)).
+- **v0.1 → v0.2**: clusters can own several zones (schema version 2, migrated
+  automatically on first start). Existing clusters keep their zone and token.
+  The API's `whoami` and `Cluster` now carry `zones`; `whoami` still has `zone`
+  for old operators. Upgrade the server first, then the operators.
+
+### Compatibility
+
+| | Operator v0.1.x | Operator v0.2.0+ |
+|---|---|---|
+| **Server v0.1.x** | yes | yes (uses the single `zone` from `whoami`) |
+| **Server v0.2.0+** | yes, but registers names only in the cluster's first zone (alphabetical) | yes |
 
 ## Troubleshooting
 
@@ -1126,7 +1252,9 @@ or DNS behavior.
 ### Cutting a release
 
 ```sh
-# 1. main is green in CI; update the image tag in operator/config/operator.yaml
+# 1. main is green in CI; add the version to "Version notes" under Upgrading
+#    (schema, server, operator, action needed); update the image tag in
+#    operator/config/operator.yaml
 sed -i '' 's#horus-operator:v[0-9.]*#horus-operator:v0.2.0#' operator/config/operator.yaml   # GNU sed: sed -i
 git commit -am "Release v0.2.0"
 git push

@@ -57,6 +57,13 @@ make e2e             # kind e2e (docker, kind, kubectl, dig); KEEP=1 keeps it up
 - Tests next to code, table-driven where it helps. `go test -race` must pass.
 - Code, comments and docs in English.
 
+## Releases
+
+Follow "Cutting a release" in README.md. Every release adds a row to the
+"Version notes" table under "Upgrading" (schema version, server/operator
+changes, action needed). A schema change needs a new `migrate_vN.sql` and a
+rollback note.
+
 ## Known gaps / next steps
 
 - `make e2e` is not in CI (needs kind, dig and a host-reachable horus on the
